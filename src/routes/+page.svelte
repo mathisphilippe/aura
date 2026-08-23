@@ -9,6 +9,7 @@
     avatar_url: string | null;
     is_coloc: boolean;
     aura_score: number;
+    all_time_aura?: number;
   };
 
   type AuraRequest = {
@@ -19,24 +20,41 @@
     created_at: string;
     status: string;
     creator_id: string;
+    target_id: string;
     target: { username: string; avatar_url: string | null };
     creator: { username: string };
     votes: { voter_id: string; vote_type: string }[];
     delta?: number;
   };
 
+  type SeasonArchive = {
+    month_label: string;
+    winner: { username: string; avatar_url: string | null };
+    winner_score: number;
+    loser: { username: string; avatar_url: string | null };
+    loser_score: number;
+  };
+
   // Navigation par onglets
   let currentTab = $state<'feed' | 'create' | 'leaderboard' | 'profile'>('feed');
-  let leaderboardType = $state<'coloc' | 'all' | 'monthly'>('coloc');
+  let mainLeaderboard = $state<'coloc' | 'all' | 'monthly'>('coloc');
+  let subLeaderboardTime = $state<'month' | 'alltime'>('month');
 
   let currentUserId = $state<string | null>(null);
   let myProfile = $state<Profile | null>(null);
   let profiles = $state<Profile[]>([]);
   let activeRequests = $state<AuraRequest[]>([]);
   let resolvedMonthlyRequests = $state<AuraRequest[]>([]);
+  let lastSeason = $state<SeasonArchive | null>(null);
   let loading = $state(true);
 
-  // Formulaire Demande
+  // Pull-to-refresh
+  let mainContainer = $state<HTMLElement | null>(null);
+  let pullStartY = 0;
+  let pullDistance = $state(0);
+  let isRefreshing = $state(false);
+
+  // Formulaire Demande (inclut tout le monde, soi-même compris)
   let targetUsers = $state<Profile[]>([]);
   let selectedTargetId = $state<string>('');
   let description = $state<string>('');
@@ -55,17 +73,27 @@
   let modalMediaUrl = $state<string | null>(null);
   let isDownloading = $state(false);
 
-  let filteredProfiles = $derived(
-    leaderboardType === 'coloc'
+  // Gestion du son vidéo
+  let unmutedVideoId = $state<string | null>(null);
+
+  // Profils filtrés et ordonnés
+  let displayedProfiles = $derived.by(() => {
+    let list = mainLeaderboard === 'coloc'
       ? profiles.filter(p => p.is_coloc)
-      : profiles
-  );
+      : profiles;
+
+    return [...list].sort((a, b) => {
+      if (subLeaderboardTime === 'alltime') {
+        return (b.all_time_aura ?? 100) - (a.all_time_aura ?? 100);
+      }
+      return b.aura_score - a.aura_score;
+    });
+  });
 
   let myRank = $derived(
     profiles.findIndex(p => p.id === currentUserId) + 1
   );
 
-  // Top 3 & Flop 3 du mois
   let top3Requests = $derived(
     [...resolvedMonthlyRequests]
       .filter(r => (r.delta ?? 0) > 0)
@@ -85,26 +113,122 @@
     return url.match(/\.(mp4|webm|ogg|mov)$/i) !== null;
   }
 
+  // Pull-to-refresh handlers
+  function handleTouchStart(e: TouchEvent) {
+    if (!mainContainer || mainContainer.scrollTop > 0 || isRefreshing) return;
+    pullStartY = e.touches[0].clientY;
+  }
+
+  function handleTouchMove(e: TouchEvent) {
+    if (!mainContainer || mainContainer.scrollTop > 0 || isRefreshing || pullStartY === 0) return;
+    const currentY = e.touches[0].clientY;
+    const diff = currentY - pullStartY;
+
+    if (diff > 0) {
+      pullDistance = Math.min(diff * 0.45, 80);
+    }
+  }
+
+  async function handleTouchEnd() {
+    if (pullDistance >= 55 && !isRefreshing) {
+      isRefreshing = true;
+      pullDistance = 50;
+      await loadData();
+      isRefreshing = false;
+    }
+    pullStartY = 0;
+    pullDistance = 0;
+  }
+
+  // Compression automatique des photos dans le navigateur
+  async function compressImageClient(file: File): Promise<File> {
+    if (!file.type.startsWith('image/')) return file;
+    return new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = (e) => {
+        const img = new Image();
+        img.src = e.target?.result as string;
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          const MAX_WIDTH = 1200;
+          let width = img.width;
+          let height = img.height;
+
+          if (width > MAX_WIDTH) {
+            height = Math.round((height * MAX_WIDTH) / width);
+            width = MAX_WIDTH;
+          }
+
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          ctx?.drawImage(img, 0, 0, width, height);
+
+          canvas.toBlob((blob) => {
+            if (blob) {
+              resolve(new File([blob], `photo_${Date.now()}.jpg`, { type: 'image/jpeg' }));
+            } else {
+              resolve(file);
+            }
+          }, 'image/jpeg', 0.82);
+        };
+      };
+    });
+  }
+
+  function checkVideoDuration(file: File): Promise<boolean> {
+    return new Promise((resolve) => {
+      const video = document.createElement('video');
+      video.preload = 'metadata';
+      video.onloadedmetadata = () => {
+        window.URL.revokeObjectURL(video.src);
+        resolve(video.duration <= 32);
+      };
+      video.onerror = () => resolve(true);
+      video.src = URL.createObjectURL(file);
+    });
+  }
+
+  // Téléchargement direct vers la pellicule
   async function downloadCurrentMedia() {
     if (!modalMediaUrl) return;
     isDownloading = true;
+
     try {
       const response = await fetch(modalMediaUrl);
       const blob = await response.blob();
-      const blobUrl = URL.createObjectURL(blob);
-
-      const link = document.createElement('a');
-      link.href = blobUrl;
       const ext = modalMediaUrl.split('.').pop()?.split('?')[0] || (isVideo(modalMediaUrl) ? 'mp4' : 'jpg');
-      link.download = `aura_${Date.now()}.${ext}`;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(blobUrl);
+      const file = new File([blob], `aura_${Date.now()}.${ext}`, { type: blob.type });
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({
+          files: [file],
+          title: 'Aura Media'
+        });
+      } else {
+        const blobUrl = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = blobUrl;
+        link.download = `aura_${Date.now()}.${ext}`;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(blobUrl);
+      }
     } catch {
       window.open(modalMediaUrl, '_blank');
     } finally {
       isDownloading = false;
+    }
+  }
+
+  function toggleVideoSound(e: Event, reqId: string) {
+    e.stopPropagation();
+    if (unmutedVideoId === reqId) {
+      unmutedVideoId = null;
+    } else {
+      unmutedVideoId = reqId;
     }
   }
 
@@ -118,8 +242,8 @@
     }
     currentUserId = session.user.id;
 
-    // Résolution des votes expirés
     await supabase.rpc('resolve_expired_aura_requests');
+    await supabase.rpc('check_and_reset_monthly_aura');
 
     // 1. Profils
     const { data: profilesData } = await supabase
@@ -129,7 +253,8 @@
 
     if (profilesData) {
       profiles = profilesData;
-      targetUsers = profilesData.filter(p => p.id !== currentUserId);
+      // Permet de choisir TOUT LE MONDE (soi-même inclus)
+      targetUsers = profilesData;
       myProfile = profilesData.find(p => p.id === currentUserId) || null;
       if (myProfile) {
         newUsername = myProfile.username;
@@ -148,6 +273,7 @@
         created_at,
         status,
         creator_id,
+        target_id,
         target:profiles!aura_requests_target_id_fkey(username, avatar_url),
         creator:profiles!aura_requests_creator_id_fkey(username),
         votes(voter_id, vote_type)
@@ -174,6 +300,7 @@
         created_at,
         status,
         creator_id,
+        target_id,
         target:profiles!aura_requests_target_id_fkey(username, avatar_url),
         creator:profiles!aura_requests_creator_id_fkey(username),
         votes(voter_id, vote_type)
@@ -192,6 +319,24 @@
       });
     }
 
+    // 4. Archive du mois précédent
+    const { data: seasonData } = await supabase
+      .from('monthly_seasons')
+      .select(`
+        month_label,
+        winner_score,
+        loser_score,
+        winner:profiles!monthly_seasons_winner_id_fkey(username, avatar_url),
+        loser:profiles!monthly_seasons_loser_id_fkey(username, avatar_url)
+      `)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (seasonData) {
+      lastSeason = seasonData as unknown as SeasonArchive;
+    }
+
     loading = false;
   }
 
@@ -199,28 +344,31 @@
     if (!currentUserId) return;
 
     const request = activeRequests.find(r => r.id === requestId);
-    const existingVote = request?.votes?.find(v => v.voter_id === currentUserId);
+    if (!request) return;
+
+    // Bloque le vote si la cible est l'utilisateur connecté
+    if (request.target_id === currentUserId) {
+      alert("Tu ne peux pas voter pour ton propre dossier !");
+      return;
+    }
+
+    const existingVote = request.votes?.find(v => v.voter_id === currentUserId);
 
     if (existingVote) {
       if (existingVote.vote_type === voteType) {
-        // Annuler le vote si on clique sur le même bouton
         const { error } = await supabase
           .from('votes')
           .delete()
           .match({ request_id: requestId, voter_id: currentUserId });
-
         if (error) alert(error.message);
       } else {
-        // Modifier le vote si on clique sur l'autre choix
         const { error } = await supabase
           .from('votes')
           .update({ vote_type: voteType })
           .match({ request_id: requestId, voter_id: currentUserId });
-
         if (error) alert(error.message);
       }
     } else {
-      // Nouveau vote
       const { error } = await supabase
         .from('votes')
         .insert({
@@ -228,7 +376,6 @@
           voter_id: currentUserId,
           vote_type: voteType
         });
-
       if (error) alert(error.message);
     }
 
@@ -246,13 +393,21 @@
       let mediaUrl: string | null = null;
 
       if (fileToUpload) {
-        const fileExt = fileToUpload.name.split('.').pop();
+        if (fileToUpload.type.startsWith('video/')) {
+          const isValid = await checkVideoDuration(fileToUpload);
+          if (!isValid) {
+            throw new Error("La vidéo ne doit pas dépasser 30 secondes !");
+          }
+        }
+
+        const fileToProcess = await compressImageClient(fileToUpload);
+        const fileExt = fileToProcess.name.split('.').pop();
         const fileName = `${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${fileExt}`;
         const filePath = `posts/${currentUserId}/${fileName}`;
 
         const { error: uploadError } = await supabase.storage
           .from('aura_media')
-          .upload(filePath, fileToUpload);
+          .upload(filePath, fileToProcess);
 
         if (uploadError) throw uploadError;
 
@@ -290,8 +445,9 @@
     const target = e.target as HTMLInputElement;
     if (target.files && target.files[0]) {
       const file = target.files[0];
-      avatarFile = file;
-      avatarPreview = URL.createObjectURL(file);
+      const compressed = await compressImageClient(file);
+      avatarFile = compressed;
+      avatarPreview = URL.createObjectURL(compressed);
     }
   }
 
@@ -379,15 +535,45 @@
     </button>
   </header>
 
-  <!-- Contenu Principal -->
-  <main class="main-content">
-    {#if loading}
+  <!-- Contenu Principal avec Pull-to-refresh -->
+  <main 
+    class="main-content"
+    bind:this={mainContainer}
+    ontouchstart={handleTouchStart}
+    ontouchmove={handleTouchMove}
+    ontouchend={handleTouchEnd}
+  >
+    <!-- Indicateur Pull to Refresh -->
+    {#if pullDistance > 0 || isRefreshing}
+      <div class="pull-indicator" style="transform: translateY({pullDistance}px)">
+        {#if isRefreshing}
+          <div class="pull-spinner"></div>
+        {:else}
+          <div class="pull-arrow" style="transform: rotate({Math.min(pullDistance * 3.6, 180)}deg)">
+            ↓
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    {#if loading && !isRefreshing}
       <div class="center-state">
         <div class="spinner"></div>
       </div>
 
     <!-- 1. FEED D'ACCUEIL -->
     {:else if currentTab === 'feed'}
+      {#if lastSeason}
+        <div class="season-banner">
+          <div class="season-badge king">
+            👑 Roi du mois passé : <strong>{lastSeason.winner?.username}</strong> ({lastSeason.winner_score} pts)
+          </div>
+          <div class="season-badge trash">
+            💀 Pire honte : <strong>{lastSeason.loser?.username}</strong> ({lastSeason.loser_score} pts)
+          </div>
+        </div>
+      {/if}
+
       {#if activeRequests.length === 0}
         <div class="center-state">
           <p class="empty-title">Aucun jugement en cours</p>
@@ -397,9 +583,11 @@
       {:else}
         <div class="feed-list">
           {#each activeRequests as req}
+            {@const isTargetMe = req.target_id === currentUserId}
             {@const userVote = req.votes?.find(v => v.voter_id === currentUserId)}
             {@const upCount = req.votes?.filter(v => v.vote_type === 'up').length || 0}
             {@const downCount = req.votes?.filter(v => v.vote_type === 'down').length || 0}
+            {@const isUnmuted = unmutedVideoId === req.id}
 
             <article class="post-card">
               <div class="post-header">
@@ -410,8 +598,15 @@
                     <div class="avatar-placeholder">{req.target.username.charAt(0).toUpperCase()}</div>
                   {/if}
                   <div>
-                    <span class="target-name">{req.target.username}</span>
-                    <span class="creator-name">par @{req.creator?.username || 'anonyme'}</span>
+                    <span class="target-name">
+                      {req.target.username}
+                      {#if isTargetMe}
+                        <span class="self-tag">(Toi)</span>
+                      {/if}
+                    </span>
+                    <span class="creator-name">
+                      {req.creator_id === currentUserId ? 'par toi-même' : `par @${req.creator?.username || 'anonyme'}`}
+                    </span>
                   </div>
                 </div>
                 <div class="badge-time">
@@ -430,7 +625,19 @@
                   onkeydown={(e) => e.key === 'Enter' && (modalMediaUrl = req.media_url)}
                 >
                   {#if isVideo(req.media_url)}
-                    <video src={req.media_url} preload="metadata" muted playsinline></video>
+                    <!-- svelte-ignore a11y_media_has_caption -->
+                    <video 
+                      src={req.media_url} 
+                      preload="metadata" 
+                      autoplay 
+                      loop 
+                      muted={!isUnmuted} 
+                      playsinline
+                    ></video>
+                    
+                    <button class="sound-toggle-btn" onclick={(e) => toggleVideoSound(e, req.id)}>
+                      {isUnmuted ? '🔊' : '🔇'}
+                    </button>
                     <span class="media-badge">▶ Vidéo</span>
                   {:else}
                     <img src={req.media_url} alt="Preuve" loading="lazy" />
@@ -438,10 +645,17 @@
                 </div>
               {/if}
 
-              <!-- Boutons avec vote réversible -->
+              <!-- Boutons de Vote avec blocage d'auto-vote -->
+              {#if isTargetMe}
+                <div class="self-vote-notice">
+                  🚫 Tu ne peux pas voter pour ton propre dossier
+                </div>
+              {/if}
+
               <div class="vote-bar">
                 <button 
                   class="vote-pill up {userVote?.vote_type === 'up' ? 'active-up' : ''}" 
+                  disabled={isTargetMe}
                   onclick={() => handleVote(req.id, 'up')}
                 >
                   <span class="vote-icon">📈</span>
@@ -451,6 +665,7 @@
 
                 <button 
                   class="vote-pill down {userVote?.vote_type === 'down' ? 'active-down' : ''}" 
+                  disabled={isTargetMe}
                   onclick={() => handleVote(req.id, 'down')}
                 >
                   <span class="vote-icon">📉</span>
@@ -467,7 +682,7 @@
     {:else if currentTab === 'create'}
       <div class="view-container">
         <h2>Nouvelle demande</h2>
-        <p class="view-sub">Un pote a fait un coup de génie ou une masterclass de la honte ?</p>
+        <p class="view-sub">Envoie la masterclass</p>
 
         {#if createError}
           <div class="banner error">{createError}</div>
@@ -477,9 +692,11 @@
           <div class="input-group">
             <label for="target-select">Qui est la cible ?</label>
             <select id="target-select" bind:value={selectedTargetId} required>
-              <option value="" disabled selected>Sélectionne un pote</option>
+              <option value="" disabled selected>Sélectionne un membre</option>
               {#each targetUsers as user}
-                <option value={user.id}>{user.username}</option>
+                <option value={user.id}>
+                  {user.username} {user.id === currentUserId ? '(Moi)' : ''}
+                </option>
               {/each}
             </select>
           </div>
@@ -496,7 +713,7 @@
           </div>
 
           <div class="input-group">
-            <label for="media-file">Preuve visuelle (photo / vidéo)</label>
+            <label for="media-file">Preuve visuelle (photo / vidéo max 30s)</label>
             <input 
               id="media-file"
               type="file" 
@@ -509,38 +726,57 @@
           </div>
 
           <button type="submit" class="submit-btn" disabled={isSubmitting}>
-            {isSubmitting ? 'Envoi en cours...' : 'Lancer le vote (2h) 🚀'}
+            {isSubmitting ? 'Envoi rapide...' : 'Lancer le vote (2h) 🚀'}
           </button>
         </form>
       </div>
 
-    <!-- 3. CLASSEMENTS & STATS DU MOIS -->
+    <!-- 3. CLASSEMENTS -->
     {:else if currentTab === 'leaderboard'}
       <div class="view-container">
+        <!-- 3 Catégories Principales -->
         <div class="segmented-control">
           <button 
-            class="segment {leaderboardType === 'coloc' ? 'active' : ''}" 
-            onclick={() => leaderboardType = 'coloc'}
+            class="segment {mainLeaderboard === 'coloc' ? 'active' : ''}" 
+            onclick={() => mainLeaderboard = 'coloc'}
           >
             🏠 Coloc
           </button>
           <button 
-            class="segment {leaderboardType === 'all' ? 'active' : ''}" 
-            onclick={() => leaderboardType = 'all'}
+            class="segment {mainLeaderboard === 'all' ? 'active' : ''}" 
+            onclick={() => mainLeaderboard = 'all'}
           >
             🌍 Tout le monde
           </button>
           <button 
-            class="segment {leaderboardType === 'monthly' ? 'active' : ''}" 
-            onclick={() => leaderboardType = 'monthly'}
+            class="segment {mainLeaderboard === 'monthly' ? 'active' : ''}" 
+            onclick={() => mainLeaderboard = 'monthly'}
           >
-            🏆 Le Mois
+            🏆 Ce mois-ci
           </button>
         </div>
 
-        {#if leaderboardType === 'monthly'}
+        <!-- Sous-onglets Mois / All-Time centrés -->
+        {#if mainLeaderboard !== 'monthly'}
+          <div class="sub-segmented-control">
+            <button 
+              class="sub-segment {subLeaderboardTime === 'month' ? 'active' : ''}" 
+              onclick={() => subLeaderboardTime = 'month'}
+            >
+              📅 Ce Mois
+            </button>
+            <button 
+              class="sub-segment {subLeaderboardTime === 'alltime' ? 'active' : ''}" 
+              onclick={() => subLeaderboardTime = 'alltime'}
+            >
+              👑 All-Time
+            </button>
+          </div>
+        {/if}
+
+        {#if mainLeaderboard === 'monthly'}
+          <!-- Vue Ce mois-ci : Top 3 & Flop 3 -->
           <div class="monthly-awards">
-            <!-- TOP 3 (MASTERCLASS) -->
             <section class="award-block">
               <h3 class="award-title gold">👑 Les Masterclass (+ Aura)</h3>
               {#if top3Requests.length === 0}
@@ -581,7 +817,6 @@
               {/if}
             </section>
 
-            <!-- FLOP 3 (HONTES) -->
             <section class="award-block">
               <h3 class="award-title red">💀 Les Pires Hontes (- Aura)</h3>
               {#if flop3Requests.length === 0}
@@ -623,8 +858,10 @@
             </section>
           </div>
         {:else}
+          <!-- Vue Liste Classement -->
           <div class="rank-list">
-            {#each filteredProfiles as profile, index}
+            {#each displayedProfiles as profile, index}
+              {@const currentScore = subLeaderboardTime === 'alltime' ? (profile.all_time_aura ?? 100) : profile.aura_score}
               <div class="rank-item {index === 0 ? 'first' : ''} {index === 1 ? 'second' : ''} {index === 2 ? 'third' : ''}">
                 <div class="rank-number">
                   {#if index === 0}👑{:else}#{index + 1}{/if}
@@ -642,8 +879,8 @@
                     <span class="pill-coloc">Coloc</span>
                   {/if}
                 </div>
-                <div class="rank-score" class:negative={profile.aura_score < 100}>
-                  {profile.aura_score}
+                <div class="rank-score" class:negative={currentScore < 100}>
+                  {currentScore}
                   <span class="score-unit">pts</span>
                 </div>
               </div>
@@ -660,20 +897,22 @@
 
         <div class="profile-stats-card">
           <div class="stat-box">
-            <span class="stat-label">Aura</span>
+            <span class="stat-label">Mois</span>
             <span class="stat-value" class:negative={(myProfile?.aura_score || 0) < 100}>
               {myProfile?.aura_score || 0}
             </span>
           </div>
           <div class="stat-divider"></div>
           <div class="stat-box">
-            <span class="stat-label">Classement</span>
-            <span class="stat-value">#{myRank || '-'}</span>
+            <span class="stat-label">All-Time</span>
+            <span class="stat-value" class:negative={(myProfile?.all_time_aura || 100) < 100}>
+              {myProfile?.all_time_aura || 100}
+            </span>
           </div>
           <div class="stat-divider"></div>
           <div class="stat-box">
-            <span class="stat-label">Rôle</span>
-            <span class="stat-value tag">{myProfile?.is_coloc ? 'Coloc 🏠' : 'Ami 🌍'}</span>
+            <span class="stat-label">Rang</span>
+            <span class="stat-value">#{myRank || '-'}</span>
           </div>
         </div>
 
@@ -759,7 +998,7 @@
   </nav>
 </div>
 
-<!-- Modal Plein Écran avec Téléchargement -->
+<!-- Modal Plein Écran avec Enregistrement direct -->
 {#if modalMediaUrl}
   <div 
     class="lightbox" 
@@ -778,7 +1017,7 @@
 
       <div class="lightbox-actions">
         <button class="lightbox-btn-download" onclick={downloadCurrentMedia} disabled={isDownloading}>
-          {isDownloading ? '⏳ Téléchargement...' : '📥 Enregistrer sur le téléphone'}
+          {isDownloading ? '⏳ Enregistrement...' : '📥 Enregistrer dans la pellicule'}
         </button>
         <button class="lightbox-close" onclick={() => modalMediaUrl = null}>✕</button>
       </div>
@@ -861,15 +1100,73 @@
     color: #fff;
   }
 
-  /* Main */
+  /* Main & Pull to refresh */
   .main-content {
     flex: 1;
     overflow-y: auto;
     padding: 12px 12px 85px;
+    position: relative;
   }
+  .pull-indicator {
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    width: 36px;
+    height: 36px;
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 30;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    transition: transform 0.1s ease-out;
+    pointer-events: none;
+    margin-left: -18px;
+  }
+  .pull-arrow {
+    color: #a855f7;
+    font-size: 16px;
+    font-weight: 900;
+    transition: transform 0.1s linear;
+  }
+  .pull-spinner {
+    width: 16px;
+    height: 16px;
+    border: 2px solid #27272a;
+    border-top-color: #8b5cf6;
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+  }
+
   .view-container { padding: 8px 4px; }
   .view-container h2 { margin: 0 0 4px; font-size: 1.3rem; }
   .view-sub { color: #71717a; font-size: 13px; margin: 0 0 18px; }
+
+  /* Season Banner */
+  .season-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 14px;
+  }
+  .season-badge {
+    font-size: 12px;
+    padding: 8px 12px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+  .season-badge.king {
+    background: rgba(234, 179, 8, 0.12);
+    border: 1px solid rgba(234, 179, 8, 0.35);
+    color: #facc15;
+  }
+  .season-badge.trash {
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #f87171;
+  }
 
   /* Feed */
   .feed-list { display: flex; flex-direction: column; gap: 16px; }
@@ -897,6 +1194,7 @@
     font-size: 14px;
   }
   .target-name { display: block; font-weight: 700; font-size: 15px; }
+  .self-tag { color: #a855f7; font-size: 13px; font-weight: 800; }
   .creator-name { display: block; font-size: 12px; color: #71717a; }
   .badge-time {
     font-size: 11px;
@@ -927,6 +1225,22 @@
     object-fit: contain;
     display: block;
   }
+  .sound-toggle-btn {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    background: rgba(0, 0, 0, 0.75);
+    border: none;
+    border-radius: 50%;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    cursor: pointer;
+    z-index: 2;
+  }
   .media-badge {
     position: absolute;
     bottom: 8px;
@@ -935,6 +1249,17 @@
     font-size: 11px;
     padding: 2px 6px;
     border-radius: 4px;
+  }
+
+  .self-vote-notice {
+    font-size: 11px;
+    font-weight: 600;
+    color: #a1a1aa;
+    text-align: center;
+    background: #18181b;
+    padding: 6px;
+    border-radius: 8px;
+    border: 1px dashed #27272a;
   }
 
   /* Votes */
@@ -954,7 +1279,11 @@
     font-size: 13px;
     transition: 0.15s ease;
   }
-  .vote-pill:active { transform: scale(0.97); }
+  .vote-pill:active:not(:disabled) { transform: scale(0.97); }
+  .vote-pill:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
   .vote-count { background: #27272a; padding: 2px 6px; border-radius: 6px; font-size: 11px; }
   .vote-pill.active-up { background: rgba(34, 197, 94, 0.15); border-color: #22c55e; color: #4ade80; }
   .vote-pill.active-down { background: rgba(239, 68, 68, 0.15); border-color: #ef4444; color: #f87171; }
@@ -1002,7 +1331,6 @@
   .stat-label { font-size: 11px; color: #71717a; text-transform: uppercase; font-weight: 700; }
   .stat-value { font-size: 16px; font-weight: 800; color: #4ade80; }
   .stat-value.negative { color: #f87171; }
-  .stat-value.tag { font-size: 13px; color: #cbd5e1; }
   .stat-divider { width: 1px; background: #27272a; }
   .avatar-edit-section { display: flex; flex-direction: column; align-items: center; gap: 8px; margin-bottom: 8px; }
   .avatar-preview-wrap { position: relative; width: 84px; height: 84px; }
@@ -1051,13 +1379,13 @@
     cursor: pointer;
   }
 
-  /* Leaderboard & Monthly Awards */
+  /* Leaderboard */
   .segmented-control {
     display: flex;
     background: #18181b;
     padding: 3px;
     border-radius: 10px;
-    margin-bottom: 16px;
+    margin-bottom: 10px;
     gap: 2px;
   }
   .segment {
@@ -1073,6 +1401,37 @@
     white-space: nowrap;
   }
   .segment.active { background: #27272a; color: #fff; }
+
+  /* Sous-onglets centrés */
+  .sub-segmented-control {
+    display: flex;
+    background: #121215;
+    border: 1px solid #1f1f23;
+    padding: 2px;
+    border-radius: 8px;
+    margin: 0 auto 16px auto;
+    gap: 2px;
+    width: fit-content;
+    min-width: 220px;
+    justify-content: center;
+  }
+  .sub-segment {
+    flex: 1;
+    background: none;
+    border: none;
+    color: #71717a;
+    padding: 6px 14px;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: center;
+  }
+  .sub-segment.active {
+    background: #27272a;
+    color: #a855f7;
+  }
+
   .rank-list { display: flex; flex-direction: column; gap: 8px; }
   .rank-item {
     display: flex;
