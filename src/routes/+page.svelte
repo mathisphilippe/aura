@@ -248,9 +248,20 @@
     }
   }
 
-  async function handleTogglePush() {
+function urlBase64ToUint8Array(base64String: string) {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = window.atob(base64);
+    const outputArray = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; ++i) {
+      outputArray[i] = rawData.charCodeAt(i);
+    }
+    return outputArray;
+  }
+
+async function handleTogglePush() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      alert("Les notifications ne sont pas supportées sur ce navigateur (ajoute l'application sur ton écran d'accueil sur iOS).");
+      alert("Les notifications ne sont pas supportées sur ce navigateur.");
       return;
     }
 
@@ -258,7 +269,7 @@
     try {
       const permission = await Notification.requestPermission();
       if (permission !== 'granted') {
-        alert("Permission de notification refusée.");
+        alert("Permission de notification refusée dans les réglages.");
         pushLoading = false;
         return;
       }
@@ -267,12 +278,21 @@
       await navigator.serviceWorker.ready;
 
       let subscription = await registration.pushManager.getSubscription();
-      if (!subscription) {
-        subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: env.PUBLIC_VAPID_KEY
-        });
+      if (subscription) {
+        await subscription.unsubscribe();
       }
+
+      const vapidKey = env.PUBLIC_VAPID_KEY;
+      if (!vapidKey) {
+        throw new Error("Clé publique VAPID manquante dans l'environnement.");
+      }
+
+      const convertedVapidKey = urlBase64ToUint8Array(vapidKey);
+
+      subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: convertedVapidKey
+      });
 
       const { error } = await supabase.from('push_subscriptions').upsert({
         user_id: currentUserId,
@@ -282,7 +302,7 @@
       if (error) throw error;
 
       isPushSubscribed = true;
-      alert("Notifications activées ! 🔔");
+      alert("Notifications activées avec succès ! 🔔");
     } catch (err: any) {
       alert("Erreur activation : " + (err.message || 'Échec'));
     } finally {

@@ -7,41 +7,41 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('push', (event) => {
-  let data = { title: '⚡ Aura', body: 'Nouveau message sur Aura !', url: '/' };
+  let title = '⚡ Nouveau sur Aura';
+  let options = {
+    body: 'Un nouveau dossier vient d’être posté !',
+    data: { url: '/' }
+  };
 
   if (event.data) {
     try {
-      data = event.data.json();
+      const payload = event.data.json();
+      title = payload.title || title;
+      options.body = payload.body || options.body;
+      options.data.url = payload.url || '/';
     } catch {
-      data.body = event.data.text();
+      options.body = event.data.text();
     }
   }
 
-  const options = {
-    body: data.body,
-    data: { url: data.url || '/' },
-    // On n'impose pas d'icône non vérifiée pour éviter le rejet iOS
-    badge: undefined,
-    tag: 'aura-notification',
-    renotify: true
-  };
-
   event.waitUntil(
-    self.registration.showNotification(data.title, options)
+    self.registration.showNotification(title, options)
   );
 });
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
+  const urlToOpen = event.notification.data?.url || '/';
+
   event.waitUntil(
-    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      for (const client of clientList) {
-        if (client.url.includes(event.notification.data.url) && 'focus' in client) {
+    clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
+      for (const client of windowClients) {
+        if (client.url.includes(urlToOpen) && 'focus' in client) {
           return client.focus();
         }
       }
       if (clients.openWindow) {
-        return clients.openWindow(event.notification.data.url);
+        return clients.openWindow(urlToOpen);
       }
     })
   );
