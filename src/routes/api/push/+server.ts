@@ -30,11 +30,17 @@ export async function POST({ request }) {
     const { data: subs, error } = await query;
     if (error || !subs) return json({ success: false, error }, { status: 500 });
 
+    const pushOptions = {
+      TTL: 60 * 60 * 24, // 24 heures
+      urgency: 'high' as const // Priorité haute pour forcer l'affichage immédiat
+    };
+
     const notifications = subs.map(async (row) => {
       try {
         await webpush.sendNotification(
           row.subscription,
-          JSON.stringify({ title, body, url })
+          JSON.stringify({ title, body, url }),
+          pushOptions
         );
       } catch (err: any) {
         if (err.statusCode === 410 || err.statusCode === 404) {
