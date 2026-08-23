@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { supabase } from '$lib/supabaseClient';
   import { goto } from '$app/navigation';
+  import { env } from '$env/dynamic/public';
 
   type Profile = {
     id: string;
@@ -54,7 +55,7 @@
   let pullDistance = $state(0);
   let isRefreshing = $state(false);
 
-  // Formulaire Demande (inclut tout le monde, soi-même compris)
+  // Formulaire Demande
   let targetUsers = $state<Profile[]>([]);
   let selectedTargetId = $state<string>('');
   let description = $state<string>('');
@@ -68,6 +69,10 @@
   let avatarPreview = $state<string | null>(null);
   let isUpdatingProfile = $state(false);
   let profileMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Notifications push state
+  let isPushSubscribed = $state(false);
+  let pushLoading = $state(false);
 
   // Lightbox & Téléchargement
   let modalMediaUrl = $state<string | null>(null);
@@ -232,6 +237,59 @@
     }
   }
 
+  // Vérification et activation des notifications push
+  async function checkPushSubscription() {
+    if ('serviceWorker' in navigator && 'PushManager' in window) {
+      const reg = await navigator.serviceWorker.getRegistration('/sw.js');
+      if (reg) {
+        const sub = await reg.pushManager.getSubscription();
+        isPushSubscribed = !!sub;
+      }
+    }
+  }
+
+  async function handleTogglePush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      alert("Les notifications ne sont pas supportées sur ce navigateur (ajoute l'application sur ton écran d'accueil sur iOS).");
+      return;
+    }
+
+    pushLoading = true;
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') {
+        alert("Permission de notification refusée.");
+        pushLoading = false;
+        return;
+      }
+
+      const registration = await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready;
+
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: env.PUBLIC_VAPID_KEY
+        });
+      }
+
+      const { error } = await supabase.from('push_subscriptions').upsert({
+        user_id: currentUserId,
+        subscription: subscription.toJSON()
+      });
+
+      if (error) throw error;
+
+      isPushSubscribed = true;
+      alert("Notifications activées ! 🔔");
+    } catch (err: any) {
+      alert("Erreur activation : " + (err.message || 'Échec'));
+    } finally {
+      pushLoading = false;
+    }
+  }
+
   async function loadData() {
     loading = true;
 
@@ -253,7 +311,6 @@
 
     if (profilesData) {
       profiles = profilesData;
-      // Permet de choisir TOUT LE MONDE (soi-même inclus)
       targetUsers = profilesData;
       myProfile = profilesData.find(p => p.id === currentUserId) || null;
       if (myProfile) {
@@ -337,6 +394,7 @@
       lastSeason = seasonData as unknown as SeasonArchive;
     }
 
+    await checkPushSubscription();
     loading = false;
   }
 
@@ -346,9 +404,8 @@
     const request = activeRequests.find(r => r.id === requestId);
     if (!request) return;
 
-    // Bloque le vote si la cible est l'utilisateur connecté
     if (request.target_id === currentUserId) {
-      alert("Tu ne peux pas voter pour ton propre dossier !");
+      alert("Tu ne peux pas voter");
       return;
     }
 
@@ -428,6 +485,18 @@
         });
 
       if (insertError) throw insertError;
+
+      // Déclenchement automatique des notifications push
+      const targetUser = targetUsers.find(u => u.id === selectedTargetId);
+      fetch('/api/push', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: '⚡ Nouveau dossier AURA !',
+          body: `Un vote a été lancé sur ${targetUser?.username || 'un membre'} : « ${description.trim().substring(0, 60)}... »`,
+          url: '/'
+        })
+      }).catch(() => {});
 
       selectedTargetId = '';
       description = '';
@@ -645,10 +714,10 @@
                 </div>
               {/if}
 
-              <!-- Boutons de Vote avec blocage d'auto-vote -->
+              <!-- Blocage du vote pour son propre dossier -->
               {#if isTargetMe}
                 <div class="self-vote-notice">
-                  🚫 Tu ne peux pas voter pour ton propre dossier
+                  Tu ne peux pas voter pour toi
                 </div>
               {/if}
 
@@ -682,7 +751,7 @@
     {:else if currentTab === 'create'}
       <div class="view-container">
         <h2>Nouvelle demande</h2>
-        <p class="view-sub">Envoie la masterclass</p>
+        <p class="view-sub">Une masterclass ou une honte ? Tu peux aussi revendiquer ton propre exploit !</p>
 
         {#if createError}
           <div class="banner error">{createError}</div>
@@ -692,10 +761,10 @@
           <div class="input-group">
             <label for="target-select">Qui est la cible ?</label>
             <select id="target-select" bind:value={selectedTargetId} required>
-              <option value="" disabled selected>Sélectionne un membre</option>
+              <option value="" disabled selected>Sélectionne un membre (ou toi-même)</option>
               {#each targetUsers as user}
                 <option value={user.id}>
-                  {user.username} {user.id === currentUserId ? '(Moi)' : ''}
+                  {user.username} {user.id === currentUserId ? '(Moi-même ⭐)' : ''}
                 </option>
               {/each}
             </select>
@@ -893,7 +962,7 @@
     {:else if currentTab === 'profile'}
       <div class="view-container">
         <h2>Mon Profil</h2>
-        <p class="view-sub">Gère ta photo, ton pseudo et tes stats.</p>
+        <p class="view-sub">Gère ta photo, ton pseudo, tes notifications et tes stats.</p>
 
         <div class="profile-stats-card">
           <div class="stat-box">
@@ -960,6 +1029,16 @@
         </form>
 
         <hr class="separator" />
+
+        <!-- Bouton Notifications Push -->
+        <button 
+          type="button"
+          class="push-btn {isPushSubscribed ? 'active' : ''}" 
+          onclick={handleTogglePush}
+          disabled={pushLoading}
+        >
+          <span>{isPushSubscribed ? '🔔 Notifications Push Activées' : '🔕 Activer les Notifications Push'}</span>
+        </button>
 
         <button class="logout-btn" onclick={handleLogout}>
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
@@ -1363,6 +1442,25 @@
   }
   .avatar-hint { font-size: 12px; color: #71717a; }
   .separator { border: none; border-top: 1px solid #1f1f23; margin: 24px 0 16px; }
+  
+  .push-btn {
+    width: 100%;
+    background: #18181b;
+    border: 1px solid #27272a;
+    color: #e4e4e7;
+    padding: 12px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+    margin-bottom: 10px;
+  }
+  .push-btn.active {
+    border-color: #22c55e;
+    color: #4ade80;
+    background: rgba(34, 197, 94, 0.1);
+  }
+
   .logout-btn {
     width: 100%;
     display: flex;
