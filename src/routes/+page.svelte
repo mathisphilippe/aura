@@ -641,7 +641,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
 <div class="app-layout">
   <!-- Top App Bar -->
   <header class="top-bar">
-    <div class="logo">⚡ <span>AURA</span></div>
+    <div class="logo">⚡ <span>AURA CHANZY</span></div>
     
     <button 
       class="profile-header-btn {currentTab === 'profile' ? 'active' : ''}" 
@@ -805,7 +805,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     {:else if currentTab === 'create'}
       <div class="view-container">
         <h2>Nouvelle demande</h2>
-        <p class="view-sub">Une masterclass ou une honte ? Tu peux aussi revendiquer ton propre exploit !</p>
+        <p class="view-sub">Envoie la masterclass stp</p>
 
         {#if createError}
           <div class="banner error">{createError}</div>
@@ -815,10 +815,10 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
           <div class="input-group">
             <label for="target-select">Qui est la cible ?</label>
             <select id="target-select" bind:value={selectedTargetId} required>
-              <option value="" disabled selected>Sélectionne un membre (ou toi-même)</option>
+              <option value="" disabled selected>Sélectionne un membre</option>
               {#each targetUsers as user}
                 <option value={user.id}>
-                  {user.username} {user.id === currentUserId ? '(Moi-même ⭐)' : ''}
+                  {user.username} {user.id === currentUserId ? '(Moi)' : ''}
                 </option>
               {/each}
             </select>
@@ -849,7 +849,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
           </div>
 
           <button type="submit" class="submit-btn" disabled={isSubmitting}>
-            {isSubmitting ? 'Envoi rapide...' : 'Lancer le vote (2h) 🚀'}
+            {isSubmitting ? 'Envoi rapide...' : 'Lancer le vote (2h)'}
           </button>
         </form>
       </div>
@@ -1159,7 +1159,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
 {/if}
 
 <style>
-  :global(*) {
+:global(*) {
     box-sizing: border-box;
     -webkit-tap-highlight-color: transparent;
   }
@@ -1169,6 +1169,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     color: #ffffff;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     user-select: none;
+    touch-action: pan-x pan-y;
   }
 
   .app-layout {
@@ -1688,35 +1689,52 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     background: rgba(10, 10, 12, 0.92);
     backdrop-filter: blur(16px);
     border-top: 1px solid #1f1f23;
-    display: flex;
-    justify-content: space-around;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
     align-items: center;
+    padding: 0 16px;
     z-index: 20;
   }
   .nav-tab {
-    background: none;
-    border: none;
-    color: #71717a;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 3px;
-    font-size: 10px;
-    font-weight: 600;
-    cursor: pointer;
-    flex: 1;
-  }
-  .nav-tab.active { color: #ffffff; }
+      background: none;
+      border: none;
+      color: #71717a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      width: 100%;
+      height: 100%;
+    }
+
+    .nav-tab.active {
+      color: #ffffff;
+    }
+
+    .nav-tab.create-tab {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 12px;
+    }
   .plus-btn {
-    width: 44px;
-    height: 32px;
-    background: linear-gradient(135deg, #6366f1, #a855f7);
-    border-radius: 10px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    color: white;
-    box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
+      width: 46px;
+      height: 34px;
+      background: linear-gradient(135deg, #6366f1, #a855f7);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
+      transition: transform 0.1s ease;
+    }
+    .plus-btn:active {
+    transform: scale(0.92);
   }
 
   /* Lightbox */
