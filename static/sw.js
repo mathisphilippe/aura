@@ -17,14 +17,16 @@ self.addEventListener('push', (event) => {
       if (payload.title) title = payload.title;
       if (payload.body) body = payload.body;
       if (payload.url) url = payload.url;
-    } catch {
+    } catch (e) {
       body = event.data.text();
     }
   }
 
   const options = {
     body: body,
-    data: { url: url }
+    data: { url: url },
+    vibrate: [100, 50, 100],
+    requireInteraction: false
   };
 
   event.waitUntil(
