@@ -418,45 +418,79 @@ async function handleTogglePush() {
     loading = false;
   }
 
-  async function handleVote(requestId: string, voteType: 'up' | 'down') {
+async function handleVote(requestId: string, voteType: 'up' | 'down') {
     if (!currentUserId) return;
 
-    const request = activeRequests.find(r => r.id === requestId);
-    if (!request) return;
+    const requestIndex = activeRequests.findIndex(r => r.id === requestId);
+    if (requestIndex === -1) return;
+
+    const request = activeRequests[requestIndex];
 
     if (request.target_id === currentUserId) {
-      alert("Tu ne peux pas voter");
+      alert("Tu ne peux pas voter pour ton propre dossier !");
       return;
     }
 
-    const existingVote = request.votes?.find(v => v.voter_id === currentUserId);
+    // Sauvegarde de l'état pour rollback en cas d'erreur réseau
+    const previousVotes = [...(request.votes || [])];
+    const existingVoteIndex = previousVotes.findIndex(v => v.voter_id === currentUserId);
+    const existingVote = existingVoteIndex !== -1 ? previousVotes[existingVoteIndex] : null;
 
+    let updatedVotes = [...previousVotes];
+    let action: 'delete' | 'update' | 'insert';
+
+    // 1. Mise à jour optimiste immédiate dans l'interface (zéro chargement)
     if (existingVote) {
       if (existingVote.vote_type === voteType) {
+        updatedVotes.splice(existingVoteIndex, 1);
+        action = 'delete';
+      } else {
+        updatedVotes[existingVoteIndex] = { ...existingVote, vote_type: voteType };
+        action = 'update';
+      }
+    } else {
+      updatedVotes.push({ voter_id: currentUserId, vote_type: voteType });
+      action = 'insert';
+    }
+
+    // Mise à jour réactive sans toucher à "loading"
+    activeRequests[requestIndex] = {
+      ...request,
+      votes: updatedVotes
+    };
+
+    // 2. Exécution de la requête Supabase en tâche de fond
+    try {
+      if (action === 'delete') {
         const { error } = await supabase
           .from('votes')
           .delete()
           .match({ request_id: requestId, voter_id: currentUserId });
-        if (error) alert(error.message);
-      } else {
+        if (error) throw error;
+      } else if (action === 'update') {
         const { error } = await supabase
           .from('votes')
           .update({ vote_type: voteType })
           .match({ request_id: requestId, voter_id: currentUserId });
-        if (error) alert(error.message);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase
+          .from('votes')
+          .insert({
+            request_id: requestId,
+            voter_id: currentUserId,
+            vote_type: voteType
+          });
+        if (error) throw error;
       }
-    } else {
-      const { error } = await supabase
-        .from('votes')
-        .insert({
-          request_id: requestId,
-          voter_id: currentUserId,
-          vote_type: voteType
-        });
-      if (error) alert(error.message);
+    } catch (err: any) {
+      // Rollback discret en cas d'échec
+      activeRequests[requestIndex] = {
+        ...request,
+        votes: previousVotes
+      };
+      alert(err.message || 'Erreur lors du vote.');
     }
-
-    await loadData();
   }
 
   async function handleCreateRequest(e: Event) {
@@ -1761,6 +1795,24 @@ async function handleTogglePush() {
     font-weight: 600;
     font-size: 13px;
     cursor: pointer;
+  }
+  .vote-pill {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px;
+    border-radius: 12px;
+    border: 1px solid #27272a;
+    background: #18181b;
+    color: #fff;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 13px;
+    transition: transform 0.1s ease, background 0.15s ease, border-color 0.15s ease;
+  }
+  .vote-pill:active:not(:disabled) {
+    transform: scale(0.92);
   }
   .spinner {
     width: 28px;
