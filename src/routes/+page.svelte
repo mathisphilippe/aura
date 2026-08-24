@@ -546,7 +546,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          title: '⚡ Nouveau dossier AURA !',
+          title: "⚡ C'est l'heure de l'AURA !",
           body: `Un vote a été lancé sur ${targetUser?.username || 'un membre'} : « ${description.trim().substring(0, 60)}... »`,
           url: '/'
         })
