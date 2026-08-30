@@ -394,6 +394,49 @@
         const req = activeRequests.find(r => r.id === activeCommentRequestId);
         if (req) {
           req.comments_count = (req.comments_count || 0) + 1;
+
+          // --- Notifications ciblées & Mentions @pseudo ---
+          const commenterName = myProfile?.username || 'Un membre';
+          const targetUserIds = new Set<string>();
+
+          // Notifier le créateur du vote et la cible
+          if (req.creator_id && req.creator_id !== currentUserId) {
+            targetUserIds.add(req.creator_id);
+          }
+          if (req.target_id && req.target_id !== currentUserId) {
+            targetUserIds.add(req.target_id);
+          }
+
+          // Détecter les mentions @pseudo
+          const matches = content.match(/@([a-zA-Z0-9_-]+)/g);
+          if (matches) {
+            matches.forEach((tag) => {
+              const cleanUsername = tag.substring(1).toLowerCase();
+              const mentionedProfile = profiles.find(
+                p => p.username.toLowerCase() === cleanUsername
+              );
+              if (mentionedProfile && mentionedProfile.id !== currentUserId) {
+                targetUserIds.add(mentionedProfile.id);
+              }
+            });
+          }
+
+          if (targetUserIds.size > 0) {
+            const previewText = content 
+              ? `« ${content.substring(0, 50)}${content.length > 50 ? '...' : ''} »` 
+              : 'a envoyé une image 📷';
+
+            fetch('/api/push', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                title: `💬 ${commenterName} a commenté !`,
+                body: previewText,
+                url: '/',
+                targetUserIds: Array.from(targetUserIds)
+              })
+            }).catch(() => {});
+          }
         }
       }
 
@@ -726,6 +769,7 @@
         mediaUrl = urlData.publicUrl;
       }
 
+      // Expiration sur 24 heures
       const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
       const { error: insertError } = await supabase
@@ -1194,6 +1238,7 @@
             </section>
           </div>
         {:else}
+          <!-- Vue Liste Classement avec couronnes ex-aequo -->
           {@const maxScore = displayedProfiles.length > 0 
             ? (subLeaderboardTime === 'alltime' ? (displayedProfiles[0].all_time_aura ?? displayedProfiles[0].aura_score ?? 100) : displayedProfiles[0].aura_score)
             : 0}
@@ -1444,7 +1489,7 @@
 
         <input 
           type="text" 
-          placeholder="Écris ton commentaire..." 
+          placeholder="Écris ton commentaire... (@pseudo)" 
           bind:value={newCommentText} 
           disabled={isSendingComment} 
         />
