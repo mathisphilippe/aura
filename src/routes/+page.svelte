@@ -4,6 +4,15 @@
   import { goto } from '$app/navigation';
   import { env } from '$env/dynamic/public';
 
+  type Comment = {
+    id: string;
+    request_id: string;
+    user_id: string;
+    content: string;
+    created_at: string;
+    user: { username: string; avatar_url: string | null };
+  };
+
   type Profile = {
     id: string;
     username: string;
@@ -25,6 +34,7 @@
     target: { username: string; avatar_url: string | null };
     creator: { username: string };
     votes: { voter_id: string; vote_type: string }[];
+    comments_count?: number;
     delta?: number;
   };
 
@@ -48,6 +58,13 @@
   let resolvedMonthlyRequests = $state<AuraRequest[]>([]);
   let lastSeason = $state<SeasonArchive | null>(null);
   let loading = $state(true);
+
+  // Commentaires
+  let activeCommentRequestId = $state<string | null>(null);
+  let activeComments = $state<Comment[]>([]);
+  let newCommentText = $state('');
+  let isSendingComment = $state(false);
+  let loadingComments = $state(false);
 
   // Pull-to-refresh
   let mainContainer = $state<HTMLElement | null>(null);
@@ -145,7 +162,6 @@
     pullDistance = 0;
   }
 
-  // Compression automatique des photos dans le navigateur
   async function compressImageClient(file: File): Promise<File> {
     if (!file.type.startsWith('image/')) return file;
     return new Promise((resolve) => {
@@ -195,7 +211,6 @@
     });
   }
 
-  // Téléchargement direct vers la pellicule
   async function downloadCurrentMedia() {
     if (!modalMediaUrl) return;
     isDownloading = true;
@@ -237,7 +252,108 @@
     }
   }
 
-  // Vérification et activation des notifications push
+  // --- Commentaires ---
+  async function openComments(requestId: string) {
+    activeCommentRequestId = requestId;
+    loadingComments = true;
+    newCommentText = '';
+
+    const { data, error } = await supabase
+      .from('request_comments')
+      .select(`
+        id,
+        request_id,
+        user_id,
+        content,
+        created_at,
+        user:profiles!request_comments_user_id_fkey(username, avatar_url)
+      `)
+      .eq('request_id', requestId)
+      .order('created_at', { ascending: true });
+
+    if (!error && data) {
+      activeComments = data as unknown as Comment[];
+    }
+    loadingComments = false;
+  }
+
+  function closeComments() {
+    activeCommentRequestId = null;
+    activeComments = [];
+  }
+
+  async function handleAddComment(e: Event) {
+    e.preventDefault();
+    if (!newCommentText.trim() || !activeCommentRequestId || !currentUserId || isSendingComment) return;
+
+    isSendingComment = true;
+    const content = newCommentText.trim();
+    newCommentText = '';
+
+    const { data, error } = await supabase
+      .from('request_comments')
+      .insert({
+        request_id: activeCommentRequestId,
+        user_id: currentUserId,
+        content
+      })
+      .select(`
+        id,
+        request_id,
+        user_id,
+        content,
+        created_at,
+        user:profiles!request_comments_user_id_fkey(username, avatar_url)
+      `)
+      .single();
+
+    if (!error && data) {
+      activeComments = [...activeComments, data as unknown as Comment];
+      const req = activeRequests.find(r => r.id === activeCommentRequestId);
+      if (req) {
+        req.comments_count = (req.comments_count || 0) + 1;
+      }
+    } else if (error) {
+      alert("Erreur lors de l'envoi du commentaire : " + error.message);
+    }
+    isSendingComment = false;
+  }
+
+  async function handleDeleteComment(commentId: string) {
+    const { error } = await supabase
+      .from('request_comments')
+      .delete()
+      .eq('id', commentId);
+
+    if (!error) {
+      activeComments = activeComments.filter(c => c.id !== commentId);
+      const req = activeRequests.find(r => r.id === activeCommentRequestId);
+      if (req && req.comments_count && req.comments_count > 0) {
+        req.comments_count -= 1;
+      }
+    }
+  }
+
+  // --- Suppression d'un vote ---
+  async function handleDeleteRequest(requestId: string) {
+    if (!confirm("Voulez-vous vraiment annuler et supprimer ce vote ?")) return;
+
+    try {
+      const { error } = await supabase
+        .from('aura_requests')
+        .delete()
+        .eq('id', requestId)
+        .eq('creator_id', currentUserId);
+
+      if (error) throw error;
+
+      activeRequests = activeRequests.filter(r => r.id !== requestId);
+    } catch (err: any) {
+      alert("Erreur lors de la suppression : " + (err.message || 'Échec'));
+    }
+  }
+
+  // --- Push Notifications ---
   async function checkPushSubscription() {
     if ('serviceWorker' in navigator && 'PushManager' in window) {
       const reg = await navigator.serviceWorker.getRegistration('/sw.js');
@@ -248,7 +364,7 @@
     }
   }
 
-function urlBase64ToUint8Array(base64String: string) {
+  function urlBase64ToUint8Array(base64String: string) {
     const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
     const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
     const rawData = window.atob(base64);
@@ -259,7 +375,7 @@ function urlBase64ToUint8Array(base64String: string) {
     return outputArray;
   }
 
-async function handleTogglePush() {
+  async function handleTogglePush() {
     if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
       alert("Les notifications ne sont pas supportées sur ce navigateur.");
       return;
@@ -339,7 +455,7 @@ async function handleTogglePush() {
       }
     }
 
-    // 2. Demandes actives
+    // 2. Demandes actives avec comptage des commentaires
     const { data: requestsData } = await supabase
       .from('aura_requests')
       .select(`
@@ -353,19 +469,23 @@ async function handleTogglePush() {
         target_id,
         target:profiles!aura_requests_target_id_fkey(username, avatar_url),
         creator:profiles!aura_requests_creator_id_fkey(username),
-        votes(voter_id, vote_type)
+        votes(voter_id, vote_type),
+        request_comments(id)
       `)
       .eq('status', 'pending')
       .gt('expires_at', new Date().toISOString())
       .order('created_at', { ascending: false });
 
     if (requestsData) {
-      activeRequests = requestsData as unknown as AuraRequest[];
+      activeRequests = (requestsData as any[]).map(req => ({
+        ...req,
+        comments_count: req.request_comments?.length || 0
+      })) as AuraRequest[];
     }
 
-    // 3. Demandes résolues (30 derniers jours)
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    // 3. Demandes résolues (depuis le 1er du mois en cours)
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
 
     const { data: monthlyData } = await supabase
       .from('aura_requests')
@@ -383,7 +503,7 @@ async function handleTogglePush() {
         votes(voter_id, vote_type)
       `)
       .eq('status', 'resolved')
-      .gte('created_at', thirtyDaysAgo.toISOString());
+      .gte('created_at', startOfMonth.toISOString());
 
     if (monthlyData) {
       resolvedMonthlyRequests = (monthlyData as unknown as AuraRequest[]).map(req => {
@@ -418,7 +538,7 @@ async function handleTogglePush() {
     loading = false;
   }
 
-async function handleVote(requestId: string, voteType: 'up' | 'down') {
+  async function handleVote(requestId: string, voteType: 'up' | 'down') {
     if (!currentUserId) return;
 
     const requestIndex = activeRequests.findIndex(r => r.id === requestId);
@@ -431,7 +551,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
       return;
     }
 
-    // Sauvegarde de l'état pour rollback en cas d'erreur réseau
     const previousVotes = [...(request.votes || [])];
     const existingVoteIndex = previousVotes.findIndex(v => v.voter_id === currentUserId);
     const existingVote = existingVoteIndex !== -1 ? previousVotes[existingVoteIndex] : null;
@@ -439,7 +558,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     let updatedVotes = [...previousVotes];
     let action: 'delete' | 'update' | 'insert';
 
-    // 1. Mise à jour optimiste immédiate dans l'interface (zéro chargement)
     if (existingVote) {
       if (existingVote.vote_type === voteType) {
         updatedVotes.splice(existingVoteIndex, 1);
@@ -453,13 +571,11 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
       action = 'insert';
     }
 
-    // Mise à jour réactive sans toucher à "loading"
     activeRequests[requestIndex] = {
       ...request,
       votes: updatedVotes
     };
 
-    // 2. Exécution de la requête Supabase en tâche de fond
     try {
       if (action === 'delete') {
         const { error } = await supabase
@@ -484,7 +600,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
         if (error) throw error;
       }
     } catch (err: any) {
-      // Rollback discret en cas d'échec
       activeRequests[requestIndex] = {
         ...request,
         votes: previousVotes
@@ -529,18 +644,21 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
         mediaUrl = urlData.publicUrl;
       }
 
+      // Expiration fixée à 24 heures
+      const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+
       const { error: insertError } = await supabase
         .from('aura_requests')
         .insert({
           creator_id: currentUserId,
           target_id: selectedTargetId,
           description: description.trim(),
-          media_url: mediaUrl
+          media_url: mediaUrl,
+          expires_at: expiresAt
         });
 
       if (insertError) throw insertError;
 
-      // Déclenchement automatique des notifications push
       const targetUser = targetUsers.find(u => u.id === selectedTargetId);
       fetch('/api/push', {
         method: 'POST',
@@ -666,7 +784,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     ontouchmove={handleTouchMove}
     ontouchend={handleTouchEnd}
   >
-    <!-- Indicateur Pull to Refresh -->
     {#if pullDistance > 0 || isRefreshing}
       <div class="pull-indicator" style="transform: translateY({pullDistance}px)">
         {#if isRefreshing}
@@ -732,8 +849,20 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
                     </span>
                   </div>
                 </div>
-                <div class="badge-time">
-                  ⏱ {getTimeRemaining(req.expires_at)}
+
+                <div class="header-right-actions">
+                  <div class="badge-time">
+                    ⏱ {getTimeRemaining(req.expires_at)}
+                  </div>
+                  {#if req.creator_id === currentUserId}
+                    <button 
+                      class="delete-post-btn" 
+                      onclick={() => handleDeleteRequest(req.id)}
+                      title="Supprimer mon vote"
+                    >
+                      🗑️
+                    </button>
+                  {/if}
                 </div>
               </div>
 
@@ -768,13 +897,13 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
                 </div>
               {/if}
 
-              <!-- Blocage du vote pour son propre dossier -->
               {#if isTargetMe}
                 <div class="self-vote-notice">
                   Tu ne peux pas voter pour toi
                 </div>
               {/if}
 
+              <!-- Barre de vote -->
               <div class="vote-bar">
                 <button 
                   class="vote-pill up {userVote?.vote_type === 'up' ? 'active-up' : ''}" 
@@ -796,6 +925,12 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
                   <span class="vote-count">{downCount}</span>
                 </button>
               </div>
+
+              <!-- Bouton d'accès aux Commentaires -->
+              <button class="comment-trigger-btn" onclick={() => openComments(req.id)}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                <span>{req.comments_count ? `${req.comments_count} commentaire${req.comments_count > 1 ? 's' : ''}` : 'Ajouter un commentaire...'}</span>
+              </button>
             </article>
           {/each}
         </div>
@@ -849,7 +984,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
           </div>
 
           <button type="submit" class="submit-btn" disabled={isSubmitting}>
-            {isSubmitting ? 'Envoi rapide...' : 'Lancer le vote (2h)'}
+            {isSubmitting ? 'Envoi rapide...' : 'Lancer le vote (24h)'}
           </button>
         </form>
       </div>
@@ -857,7 +992,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     <!-- 3. CLASSEMENTS -->
     {:else if currentTab === 'leaderboard'}
       <div class="view-container">
-        <!-- 3 Catégories Principales -->
         <div class="segmented-control">
           <button 
             class="segment {mainLeaderboard === 'coloc' ? 'active' : ''}" 
@@ -879,7 +1013,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
           </button>
         </div>
 
-        <!-- Sous-onglets Mois / All-Time centrés -->
         {#if mainLeaderboard !== 'monthly'}
           <div class="sub-segmented-control">
             <button 
@@ -898,7 +1031,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
         {/if}
 
         {#if mainLeaderboard === 'monthly'}
-          <!-- Vue Ce mois-ci : Top 3 & Flop 3 -->
           <div class="monthly-awards">
             <section class="award-block">
               <h3 class="award-title gold">👑 Les Masterclass (+ Aura)</h3>
@@ -981,13 +1113,19 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
             </section>
           </div>
         {:else}
-          <!-- Vue Liste Classement -->
+          <!-- Vue Liste Classement avec égalités au sommet -->
+          {@const maxScore = displayedProfiles.length > 0 
+            ? (subLeaderboardTime === 'alltime' ? (displayedProfiles[0].all_time_aura ?? 100) : displayedProfiles[0].aura_score)
+            : 0}
+
           <div class="rank-list">
             {#each displayedProfiles as profile, index}
               {@const currentScore = subLeaderboardTime === 'alltime' ? (profile.all_time_aura ?? 100) : profile.aura_score}
-              <div class="rank-item {index === 0 ? 'first' : ''} {index === 1 ? 'second' : ''} {index === 2 ? 'third' : ''}">
+              {@const isFirst = currentScore === maxScore && maxScore > 0}
+
+              <div class="rank-item {isFirst ? 'first' : ''} {index === 1 && !isFirst ? 'second' : ''} {index === 2 && !isFirst ? 'third' : ''}">
                 <div class="rank-number">
-                  {#if index === 0}👑{:else}#{index + 1}{/if}
+                  {#if isFirst}👑{:else}#{index + 1}{/if}
                 </div>
                 {#if profile.avatar_url}
                   <img src={profile.avatar_url} alt={profile.username} class="rank-avatar-img" />
@@ -1084,7 +1222,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
 
         <hr class="separator" />
 
-        <!-- Bouton Notifications Push -->
         <button 
           type="button"
           class="push-btn {isPushSubscribed ? 'active' : ''}" 
@@ -1131,7 +1268,72 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
   </nav>
 </div>
 
-<!-- Modal Plein Écran avec Enregistrement direct -->
+<!-- Modal Bottom-Sheet Commentaires -->
+{#if activeCommentRequestId}
+  <div 
+    class="comment-backdrop" 
+    role="button" 
+    tabindex="0"
+    onclick={closeComments}
+    onkeydown={(e) => e.key === 'Escape' && closeComments()}
+  >
+    <div class="comment-sheet" onclick={(e) => e.stopPropagation()} role="presentation">
+      <div class="sheet-header">
+        <div class="sheet-handle"></div>
+        <div class="sheet-title-row">
+          <h3>Commentaires</h3>
+          <button class="sheet-close" onclick={closeComments}>✕</button>
+        </div>
+      </div>
+
+      <div class="comment-list">
+        {#if loadingComments}
+          <div class="comment-loading"><div class="spinner"></div></div>
+        {:else if activeComments.length === 0}
+          <div class="comment-empty">
+            <span>💬</span>
+            <p>Aucun commentaire pour le moment. Lance la discussion !</p>
+          </div>
+        {:else}
+          {#each activeComments as c}
+            <div class="comment-item">
+              {#if c.user?.avatar_url}
+                <img src={c.user.avatar_url} alt={c.user.username} class="comment-avatar" />
+              {:else}
+                <div class="comment-avatar-placeholder">
+                  {c.user?.username ? c.user.username.charAt(0).toUpperCase() : '👤'}
+                </div>
+              {/if}
+              <div class="comment-content-box">
+                <div class="comment-meta">
+                  <span class="comment-author">{c.user?.username || 'Anonyme'}</span>
+                  {#if c.user_id === currentUserId}
+                    <button class="comment-del" onclick={() => handleDeleteComment(c.id)}>Supprimer</button>
+                  {/if}
+                </div>
+                <p class="comment-text">{c.content}</p>
+              </div>
+            </div>
+          {/each}
+        {/if}
+      </div>
+
+      <form onsubmit={handleAddComment} class="comment-input-bar">
+        <input 
+          type="text" 
+          placeholder="Écris ton commentaire..." 
+          bind:value={newCommentText} 
+          disabled={isSendingComment} 
+        />
+        <button type="submit" disabled={!newCommentText.trim() || isSendingComment}>
+          {isSendingComment ? '...' : 'Envoyer'}
+        </button>
+      </form>
+    </div>
+  </div>
+{/if}
+
+<!-- Modal Plein Écran Média -->
 {#if modalMediaUrl}
   <div 
     class="lightbox" 
@@ -1159,7 +1361,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
 {/if}
 
 <style>
-:global(*) {
+  :global(*) {
     box-sizing: border-box;
     -webkit-tap-highlight-color: transparent;
   }
@@ -1182,22 +1384,21 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     position: relative;
   }
 
-  /* Top Bar */
   .top-bar {
-      height: calc(54px + env(safe-area-inset-top));
-      padding-top: env(safe-area-inset-top);
-      padding-left: 16px;
-      padding-right: 16px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      border-bottom: 1px solid #1f1f23;
-      position: sticky;
-      top: 0;
-      background: rgba(0, 0, 0, 0.85);
-      backdrop-filter: blur(12px);
-      z-index: 10;
-    }
+    height: calc(54px + env(safe-area-inset-top));
+    padding-top: env(safe-area-inset-top);
+    padding-left: 16px;
+    padding-right: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid #1f1f23;
+    position: sticky;
+    top: 0;
+    background: rgba(0, 0, 0, 0.85);
+    backdrop-filter: blur(12px);
+    z-index: 10;
+  }
   .logo {
     font-weight: 900;
     font-size: 1.1rem;
@@ -1236,7 +1437,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     color: #fff;
   }
 
-  /* Main & Pull to refresh */
   .main-content {
     flex: 1;
     overflow-y: auto;
@@ -1280,7 +1480,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
   .view-container h2 { margin: 0 0 4px; font-size: 1.3rem; }
   .view-sub { color: #71717a; font-size: 13px; margin: 0 0 18px; }
 
-  /* Season Banner */
   .season-banner {
     display: flex;
     flex-direction: column;
@@ -1332,6 +1531,30 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
   .target-name { display: block; font-weight: 700; font-size: 15px; }
   .self-tag { color: #a855f7; font-size: 13px; font-weight: 800; }
   .creator-name { display: block; font-size: 12px; color: #71717a; }
+  
+  .header-right-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .delete-post-btn {
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #f87171;
+    border-radius: 8px;
+    padding: 4px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: 0.15s ease;
+  }
+  .delete-post-btn:active {
+    transform: scale(0.92);
+    background: rgba(239, 68, 68, 0.25);
+  }
+
   .badge-time {
     font-size: 11px;
     background: #1e1e24;
@@ -1398,7 +1621,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     border: 1px dashed #27272a;
   }
 
-  /* Votes */
   .vote-bar { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .vote-pill {
     display: flex;
@@ -1413,18 +1635,200 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     cursor: pointer;
     font-weight: 600;
     font-size: 13px;
-    transition: 0.15s ease;
+    transition: transform 0.1s ease, background 0.15s ease, border-color 0.15s ease;
   }
-  .vote-pill:active:not(:disabled) { transform: scale(0.97); }
-  .vote-pill:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-  }
+  .vote-pill:active:not(:disabled) { transform: scale(0.95); }
+  .vote-pill:disabled { opacity: 0.45; cursor: not-allowed; }
   .vote-count { background: #27272a; padding: 2px 6px; border-radius: 6px; font-size: 11px; }
   .vote-pill.active-up { background: rgba(34, 197, 94, 0.15); border-color: #22c55e; color: #4ade80; }
   .vote-pill.active-down { background: rgba(239, 68, 68, 0.15); border-color: #ef4444; color: #f87171; }
 
-  /* App Forms */
+  .comment-trigger-btn {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: #16161a;
+    border: 1px solid #27272a;
+    color: #a1a1aa;
+    padding: 10px 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: 0.15s ease;
+  }
+  .comment-trigger-btn:active {
+    background: #202024;
+    color: #fff;
+  }
+
+  /* Modal Bottom Sheet Commentaires */
+  .comment-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+    z-index: 100;
+    display: flex;
+    justify-content: center;
+    align-items: flex-end;
+  }
+  .comment-sheet {
+    background: #121215;
+    border-top: 1px solid #27272a;
+    border-radius: 20px 20px 0 0;
+    width: 100%;
+    max-width: 480px;
+    height: 75vh;
+    display: flex;
+    flex-direction: column;
+    animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes slideUp {
+    from { transform: translateY(100%); }
+    to { transform: translateY(0); }
+  }
+  .sheet-header {
+    padding: 12px 16px 8px;
+    border-bottom: 1px solid #1f1f23;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .sheet-handle {
+    width: 36px;
+    height: 4px;
+    background: #3f3f46;
+    border-radius: 10px;
+    margin-bottom: 8px;
+  }
+  .sheet-title-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    width: 100%;
+  }
+  .sheet-title-row h3 {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+  }
+  .sheet-close {
+    background: #1f1f23;
+    border: none;
+    color: #a1a1aa;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .comment-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .comment-loading, .comment-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: #71717a;
+    text-align: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .comment-empty span { font-size: 28px; }
+  .comment-item {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+  }
+  .comment-avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    object-fit: cover;
+  }
+  .comment-avatar-placeholder {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #27272a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: bold;
+  }
+  .comment-content-box {
+    flex: 1;
+    background: #18181b;
+    border: 1px solid #222228;
+    border-radius: 12px;
+    padding: 8px 12px;
+  }
+  .comment-meta {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 3px;
+  }
+  .comment-author {
+    font-weight: 700;
+    font-size: 12px;
+    color: #e4e4e7;
+  }
+  .comment-del {
+    background: none;
+    border: none;
+    color: #ef4444;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 0;
+  }
+  .comment-text {
+    margin: 0;
+    font-size: 13px;
+    color: #d4d4d8;
+    line-height: 1.4;
+    word-break: break-word;
+  }
+  .comment-input-bar {
+    padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+    background: #18181b;
+    border-top: 1px solid #27272a;
+    display: flex;
+    gap: 8px;
+  }
+  .comment-input-bar input {
+    flex: 1;
+    background: #121215;
+    border: 1px solid #27272a;
+    color: #fff;
+    padding: 10px 14px;
+    border-radius: 100px;
+    font-size: 14px;
+  }
+  .comment-input-bar button {
+    background: #8b5cf6;
+    border: none;
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 100px;
+    font-weight: 700;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .comment-input-bar button:disabled {
+    opacity: 0.5;
+  }
+
+  /* Formulaires et Profil */
   .app-form { display: flex; flex-direction: column; gap: 16px; }
   .input-group { display: flex; flex-direction: column; gap: 6px; }
   .input-group label { font-size: 13px; font-weight: 600; color: #a1a1aa; }
@@ -1453,7 +1857,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
   .banner.error { background: #450a0a; color: #f87171; }
   .banner.success { background: #052e16; color: #4ade80; }
 
-  /* Profil */
   .profile-stats-card {
     display: flex;
     background: #121215;
@@ -1557,7 +1960,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
   }
   .segment.active { background: #27272a; color: #fff; }
 
-  /* Sous-onglets centrés */
   .sub-segmented-control {
     display: flex;
     background: #121215;
@@ -1629,7 +2031,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
   .rank-score.negative { color: #f87171; }
   .score-unit { font-size: 10px; font-weight: 400; color: #71717a; margin-left: 2px; }
 
-  /* Monthly Awards Styles */
   .monthly-awards { display: flex; flex-direction: column; gap: 24px; }
   .award-block { display: flex; flex-direction: column; gap: 10px; }
   .award-title { font-size: 14px; font-weight: 800; margin: 0; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -1679,69 +2080,61 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     display: block;
   }
 
-  /* Bottom Bar */
   .bottom-bar {
-      position: fixed;
-      bottom: 0;
-      left: 50%;
-      transform: translateX(-50%);
-      width: 100%;
-      max-width: 480px;
-      height: calc(64px + env(safe-area-inset-bottom));
-      padding-bottom: env(safe-area-inset-bottom);
-      padding-left: 16px;
-      padding-right: 16px;
-      background: rgba(10, 10, 12, 0.92);
-      backdrop-filter: blur(16px);
-      border-top: 1px solid #1f1f23;
-      display: grid;
-      grid-template-columns: 1fr auto 1fr;
-      align-items: center;
-      z-index: 20;
-    }
-  .nav-tab {
-      background: none;
-      border: none;
-      color: #71717a;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 3px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      width: 100%;
-      height: 100%;
-    }
-
-    .nav-tab.active {
-      color: #ffffff;
-    }
-
-    .nav-tab.create-tab {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 0 12px;
-    }
-  .plus-btn {
-      width: 46px;
-      height: 34px;
-      background: linear-gradient(135deg, #6366f1, #a855f7);
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: white;
-      box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
-      transition: transform 0.1s ease;
-    }
-    .plus-btn:active {
-    transform: scale(0.92);
+    position: fixed;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100%;
+    max-width: 480px;
+    height: calc(64px + env(safe-area-inset-bottom));
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: 16px;
+    padding-right: 16px;
+    background: rgba(10, 10, 12, 0.92);
+    backdrop-filter: blur(16px);
+    border-top: 1px solid #1f1f23;
+    display: grid;
+    grid-template-columns: 1fr auto 1fr;
+    align-items: center;
+    z-index: 20;
   }
+  .nav-tab {
+    background: none;
+    border: none;
+    color: #71717a;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    width: 100%;
+    height: 100%;
+  }
+  .nav-tab.active { color: #ffffff; }
+  .nav-tab.create-tab {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 12px;
+  }
+  .plus-btn {
+    width: 46px;
+    height: 34px;
+    background: linear-gradient(135deg, #6366f1, #8b5cf6);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    box-shadow: 0 2px 8px rgba(99, 102, 241, 0.4);
+    transition: transform 0.1s ease;
+  }
+  .plus-btn:active { transform: scale(0.92); }
 
-  /* Lightbox */
   .lightbox {
     position: fixed;
     inset: 0;
@@ -1768,11 +2161,7 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     border-radius: 12px;
     object-fit: contain;
   }
-  .lightbox-actions {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
+  .lightbox-actions { display: flex; align-items: center; gap: 12px; }
   .lightbox-btn-download {
     background: #27272a;
     border: 1px solid #3f3f46;
@@ -1797,7 +2186,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     cursor: pointer;
   }
 
-  /* States */
   .center-state {
     display: flex;
     flex-direction: column;
@@ -1817,24 +2205,6 @@ async function handleVote(requestId: string, voteType: 'up' | 'down') {
     font-weight: 600;
     font-size: 13px;
     cursor: pointer;
-  }
-  .vote-pill {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    padding: 10px;
-    border-radius: 12px;
-    border: 1px solid #27272a;
-    background: #18181b;
-    color: #fff;
-    cursor: pointer;
-    font-weight: 600;
-    font-size: 13px;
-    transition: transform 0.1s ease, background 0.15s ease, border-color 0.15s ease;
-  }
-  .vote-pill:active:not(:disabled) {
-    transform: scale(0.92);
   }
   .spinner {
     width: 28px;
