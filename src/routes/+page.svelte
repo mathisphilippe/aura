@@ -9,6 +9,7 @@
     request_id: string;
     user_id: string;
     content: string;
+    image_url: string | null;
     created_at: string;
     user: { username: string; avatar_url: string | null };
   };
@@ -63,8 +64,14 @@
   let activeCommentRequestId = $state<string | null>(null);
   let activeComments = $state<Comment[]>([]);
   let newCommentText = $state('');
+  let commentImageFile = $state<File | null>(null);
+  let commentImagePreview = $state<string | null>(null);
   let isSendingComment = $state(false);
   let loadingComments = $state(false);
+
+  // Geste de fermeture du tiroir commentaires
+  let sheetStartY = 0;
+  let sheetCurrentY = $state(0);
 
   // Pull-to-refresh
   let mainContainer = $state<HTMLElement | null>(null);
@@ -105,10 +112,9 @@
       : profiles;
 
     return [...list].sort((a, b) => {
-      if (subLeaderboardTime === 'alltime') {
-        return (b.all_time_aura ?? 100) - (a.all_time_aura ?? 100);
-      }
-      return b.aura_score - a.aura_score;
+      const scoreA = subLeaderboardTime === 'alltime' ? (a.all_time_aura ?? a.aura_score ?? 100) : a.aura_score;
+      const scoreB = subLeaderboardTime === 'alltime' ? (b.all_time_aura ?? b.aura_score ?? 100) : b.aura_score;
+      return scoreB - scoreA;
     });
   });
 
@@ -137,12 +143,12 @@
 
   // Pull-to-refresh handlers
   function handleTouchStart(e: TouchEvent) {
-    if (!mainContainer || mainContainer.scrollTop > 0 || isRefreshing) return;
+    if (activeCommentRequestId || !mainContainer || mainContainer.scrollTop > 0 || isRefreshing) return;
     pullStartY = e.touches[0].clientY;
   }
 
   function handleTouchMove(e: TouchEvent) {
-    if (!mainContainer || mainContainer.scrollTop > 0 || isRefreshing || pullStartY === 0) return;
+    if (activeCommentRequestId || !mainContainer || mainContainer.scrollTop > 0 || isRefreshing || pullStartY === 0) return;
     const currentY = e.touches[0].clientY;
     const diff = currentY - pullStartY;
 
@@ -162,6 +168,7 @@
     pullDistance = 0;
   }
 
+  // Compression automatique des photos
   async function compressImageClient(file: File): Promise<File> {
     if (!file.type.startsWith('image/')) return file;
     return new Promise((resolve) => {
@@ -252,11 +259,14 @@
     }
   }
 
-  // --- Commentaires ---
+  // --- Gestion des Commentaires ---
   async function openComments(requestId: string) {
     activeCommentRequestId = requestId;
     loadingComments = true;
     newCommentText = '';
+    commentImageFile = null;
+    commentImagePreview = null;
+    sheetCurrentY = 0;
 
     const { data, error } = await supabase
       .from('request_comments')
@@ -265,6 +275,7 @@
         request_id,
         user_id,
         content,
+        image_url,
         created_at,
         user:profiles!request_comments_user_id_fkey(username, avatar_url)
       `)
@@ -280,43 +291,110 @@
   function closeComments() {
     activeCommentRequestId = null;
     activeComments = [];
+    commentImageFile = null;
+    commentImagePreview = null;
+    sheetCurrentY = 0;
+  }
+
+  function handleSheetTouchStart(e: TouchEvent) {
+    sheetStartY = e.touches[0].clientY;
+  }
+
+  function handleSheetTouchMove(e: TouchEvent) {
+    const currentY = e.touches[0].clientY;
+    const diff = currentY - sheetStartY;
+    if (diff > 0) {
+      sheetCurrentY = diff;
+    }
+  }
+
+  function handleSheetTouchEnd() {
+    if (sheetCurrentY > 120) {
+      closeComments();
+    } else {
+      sheetCurrentY = 0;
+    }
+  }
+
+  async function handleCommentImageSelect(e: Event) {
+    const target = e.target as HTMLInputElement;
+    if (target.files && target.files[0]) {
+      const file = target.files[0];
+      if (!file.type.startsWith('image/')) {
+        alert("Seules les images sont acceptées dans les commentaires.");
+        return;
+      }
+      const compressed = await compressImageClient(file);
+      commentImageFile = compressed;
+      commentImagePreview = URL.createObjectURL(compressed);
+    }
   }
 
   async function handleAddComment(e: Event) {
     e.preventDefault();
-    if (!newCommentText.trim() || !activeCommentRequestId || !currentUserId || isSendingComment) return;
+    if ((!newCommentText.trim() && !commentImageFile) || !activeCommentRequestId || !currentUserId || isSendingComment) return;
 
     isSendingComment = true;
-    const content = newCommentText.trim();
-    newCommentText = '';
+    let imageUrl: string | null = null;
 
-    const { data, error } = await supabase
-      .from('request_comments')
-      .insert({
-        request_id: activeCommentRequestId,
-        user_id: currentUserId,
-        content
-      })
-      .select(`
-        id,
-        request_id,
-        user_id,
-        content,
-        created_at,
-        user:profiles!request_comments_user_id_fkey(username, avatar_url)
-      `)
-      .single();
+    try {
+      if (commentImageFile) {
+        const fileExt = commentImageFile.name.split('.').pop();
+        const fileName = `comment_${Date.now()}_${Math.random().toString(36).substring(2, 6)}.${fileExt}`;
+        const filePath = `comments/${currentUserId}/${fileName}`;
 
-    if (!error && data) {
-      activeComments = [...activeComments, data as unknown as Comment];
-      const req = activeRequests.find(r => r.id === activeCommentRequestId);
-      if (req) {
-        req.comments_count = (req.comments_count || 0) + 1;
+        const { error: uploadError } = await supabase.storage
+          .from('aura_media')
+          .upload(filePath, commentImageFile);
+
+        if (uploadError) throw uploadError;
+
+        const { data: urlData } = supabase.storage
+          .from('aura_media')
+          .getPublicUrl(filePath);
+
+        imageUrl = urlData.publicUrl;
       }
-    } else if (error) {
-      alert("Erreur lors de l'envoi du commentaire : " + error.message);
+
+      const content = newCommentText.trim();
+
+      const { data, error } = await supabase
+        .from('request_comments')
+        .insert({
+          request_id: activeCommentRequestId,
+          user_id: currentUserId,
+          content: content || '📷 Image',
+          image_url: imageUrl
+        })
+        .select(`
+          id,
+          request_id,
+          user_id,
+          content,
+          image_url,
+          created_at,
+          user:profiles!request_comments_user_id_fkey(username, avatar_url)
+        `)
+        .single();
+
+      if (error) throw error;
+
+      if (data) {
+        activeComments = [...activeComments, data as unknown as Comment];
+        const req = activeRequests.find(r => r.id === activeCommentRequestId);
+        if (req) {
+          req.comments_count = (req.comments_count || 0) + 1;
+        }
+      }
+
+      newCommentText = '';
+      commentImageFile = null;
+      commentImagePreview = null;
+    } catch (err: any) {
+      alert("Erreur lors de l'envoi : " + (err.message || 'Échec'));
+    } finally {
+      isSendingComment = false;
     }
-    isSendingComment = false;
   }
 
   async function handleDeleteComment(commentId: string) {
@@ -455,7 +533,7 @@
       }
     }
 
-    // 2. Demandes actives avec comptage des commentaires
+    // 2. Demandes actives avec commentaires
     const { data: requestsData } = await supabase
       .from('aura_requests')
       .select(`
@@ -483,7 +561,7 @@
       })) as AuraRequest[];
     }
 
-    // 3. Demandes résolues (depuis le 1er du mois en cours)
+    // 3. Demandes résolues (1er du mois en cours)
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
 
@@ -644,7 +722,6 @@
         mediaUrl = urlData.publicUrl;
       }
 
-      // Expiration fixée à 24 heures
       const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
 
       const { error: insertError } = await supabase
@@ -756,7 +833,7 @@
   });
 </script>
 
-<div class="app-layout">
+<div class="app-layout" class:scroll-locked={activeCommentRequestId !== null}>
   <!-- Top App Bar -->
   <header class="top-bar">
     <div class="logo">⚡ <span>AURA CHANZY</span></div>
@@ -1115,12 +1192,12 @@
         {:else}
           <!-- Vue Liste Classement avec égalités au sommet -->
           {@const maxScore = displayedProfiles.length > 0 
-            ? (subLeaderboardTime === 'alltime' ? (displayedProfiles[0].all_time_aura ?? 100) : displayedProfiles[0].aura_score)
+            ? (subLeaderboardTime === 'alltime' ? (displayedProfiles[0].all_time_aura ?? displayedProfiles[0].aura_score ?? 100) : displayedProfiles[0].aura_score)
             : 0}
 
           <div class="rank-list">
             {#each displayedProfiles as profile, index}
-              {@const currentScore = subLeaderboardTime === 'alltime' ? (profile.all_time_aura ?? 100) : profile.aura_score}
+              {@const currentScore = subLeaderboardTime === 'alltime' ? (profile.all_time_aura ?? profile.aura_score ?? 100) : profile.aura_score}
               {@const isFirst = currentScore === maxScore && maxScore > 0}
 
               <div class="rank-item {isFirst ? 'first' : ''} {index === 1 && !isFirst ? 'second' : ''} {index === 2 && !isFirst ? 'third' : ''}">
@@ -1166,8 +1243,8 @@
           <div class="stat-divider"></div>
           <div class="stat-box">
             <span class="stat-label">All-Time</span>
-            <span class="stat-value" class:negative={(myProfile?.all_time_aura || 100) < 100}>
-              {myProfile?.all_time_aura || 100}
+            <span class="stat-value" class:negative={(myProfile?.all_time_aura ?? myProfile?.aura_score ?? 100) < 100}>
+              {myProfile?.all_time_aura ?? myProfile?.aura_score ?? 100}
             </span>
           </div>
           <div class="stat-divider"></div>
@@ -1277,8 +1354,19 @@
     onclick={closeComments}
     onkeydown={(e) => e.key === 'Escape' && closeComments()}
   >
-    <div class="comment-sheet" onclick={(e) => e.stopPropagation()} role="presentation">
-      <div class="sheet-header">
+    <div 
+      class="comment-sheet" 
+      style="transform: translateY({sheetCurrentY}px);"
+      onclick={(e) => e.stopPropagation()} 
+      role="presentation"
+    >
+      <!-- Zone tactile de drag down pour fermer le tiroir -->
+      <div 
+        class="sheet-header"
+        ontouchstart={handleSheetTouchStart}
+        ontouchmove={handleSheetTouchMove}
+        ontouchend={handleSheetTouchEnd}
+      >
         <div class="sheet-handle"></div>
         <div class="sheet-title-row">
           <h3>Commentaires</h3>
@@ -1311,21 +1399,56 @@
                     <button class="comment-del" onclick={() => handleDeleteComment(c.id)}>Supprimer</button>
                   {/if}
                 </div>
-                <p class="comment-text">{c.content}</p>
+
+                {#if c.content && c.content !== '📷 Image'}
+                  <p class="comment-text">{c.content}</p>
+                {/if}
+
+                {#if c.image_url}
+                  <div 
+                    class="comment-image-wrap"
+                    role="button"
+                    tabindex="0"
+                    onclick={() => modalMediaUrl = c.image_url}
+                    onkeydown={(e) => e.key === 'Enter' && (modalMediaUrl = c.image_url)}
+                  >
+                    <img src={c.image_url} alt="Image commentaire" loading="lazy" />
+                  </div>
+                {/if}
               </div>
             </div>
           {/each}
         {/if}
       </div>
 
+      <!-- Prévisualisation de l'image sélectionnée pour le commentaire -->
+      {#if commentImagePreview}
+        <div class="comment-img-preview-bar">
+          <img src={commentImagePreview} alt="Aperçu commentaire" />
+          <button type="button" class="remove-preview-btn" onclick={() => { commentImageFile = null; commentImagePreview = null; }}>✕</button>
+        </div>
+      {/if}
+
       <form onsubmit={handleAddComment} class="comment-input-bar">
+        <!-- Bouton Upload Image Commentaire -->
+        <label for="comment-img-input" class="comment-upload-btn" title="Ajouter une image">
+          📷
+        </label>
+        <input 
+          id="comment-img-input" 
+          type="file" 
+          accept="image/*" 
+          onchange={handleCommentImageSelect} 
+          style="display: none;" 
+        />
+
         <input 
           type="text" 
           placeholder="Écris ton commentaire..." 
           bind:value={newCommentText} 
           disabled={isSendingComment} 
         />
-        <button type="submit" disabled={!newCommentText.trim() || isSendingComment}>
+        <button type="submit" disabled={(!newCommentText.trim() && !commentImageFile) || isSendingComment}>
           {isSendingComment ? '...' : 'Envoyer'}
         </button>
       </form>
@@ -1382,6 +1505,9 @@
     margin: 0 auto;
     background: #000;
     position: relative;
+  }
+  .app-layout.scroll-locked {
+    overflow: hidden;
   }
 
   .top-bar {
@@ -1442,6 +1568,7 @@
     overflow-y: auto;
     padding: 12px 12px 85px;
     position: relative;
+    -webkit-overflow-scrolling: touch;
   }
   .pull-indicator {
     position: absolute;
@@ -1666,12 +1793,13 @@
   .comment-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: rgba(0, 0, 0, 0.75);
     backdrop-filter: blur(4px);
     z-index: 100;
     display: flex;
     justify-content: center;
     align-items: flex-end;
+    touch-action: none;
   }
   .comment-sheet {
     background: #121215;
@@ -1683,6 +1811,7 @@
     display: flex;
     flex-direction: column;
     animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+    transition: transform 0.1s ease-out;
   }
   @keyframes slideUp {
     from { transform: translateY(100%); }
@@ -1694,6 +1823,7 @@
     display: flex;
     flex-direction: column;
     align-items: center;
+    touch-action: pan-y;
   }
   .sheet-handle {
     width: 36px;
@@ -1730,6 +1860,8 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
   }
   .comment-loading, .comment-empty {
     display: flex;
@@ -1771,12 +1903,14 @@
     border: 1px solid #222228;
     border-radius: 12px;
     padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }
   .comment-meta {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 3px;
   }
   .comment-author {
     font-weight: 700;
@@ -1798,14 +1932,68 @@
     line-height: 1.4;
     word-break: break-word;
   }
+  .comment-image-wrap {
+    margin-top: 4px;
+    border-radius: 8px;
+    overflow: hidden;
+    max-height: 160px;
+    cursor: pointer;
+    background: #09090b;
+  }
+  .comment-image-wrap img {
+    width: 100%;
+    max-height: 160px;
+    object-fit: contain;
+    display: block;
+  }
+
+  .comment-img-preview-bar {
+    padding: 6px 16px;
+    background: #16161a;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-top: 1px solid #27272a;
+  }
+  .comment-img-preview-bar img {
+    width: 44px;
+    height: 44px;
+    border-radius: 6px;
+    object-fit: cover;
+  }
+  .remove-preview-btn {
+    background: #27272a;
+    border: none;
+    color: #fff;
+    border-radius: 50%;
+    width: 22px;
+    height: 22px;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
   .comment-input-bar {
     padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
     background: #18181b;
     border-top: 1px solid #27272a;
     display: flex;
+    align-items: center;
     gap: 8px;
   }
-  .comment-input-bar input {
+  .comment-upload-btn {
+    background: #27272a;
+    border: 1px solid #3f3f46;
+    border-radius: 50%;
+    width: 38px;
+    height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .comment-input-bar input[type="text"] {
     flex: 1;
     background: #121215;
     border: 1px solid #27272a;
@@ -1823,6 +2011,7 @@
     font-weight: 700;
     font-size: 13px;
     cursor: pointer;
+    flex-shrink: 0;
   }
   .comment-input-bar button:disabled {
     opacity: 0.5;
@@ -2201,7 +2390,7 @@
     border: 1px solid #3f3f46;
     color: white;
     padding: 10px 16px;
-    border-radius: 10px;
+    border-radius: 100px;
     font-weight: 600;
     font-size: 13px;
     cursor: pointer;
