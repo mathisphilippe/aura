@@ -69,6 +69,18 @@
   let isSendingComment = $state(false);
   let loadingComments = $state(false);
 
+  // Mentions Autocomplete State
+  let commentInputRef = $state<HTMLInputElement | null>(null);
+  let showMentionList = $state(false);
+  let mentionQuery = $state('');
+  let mentionStartIndex = $state(-1);
+
+  let filteredMentionProfiles = $derived(
+    profiles.filter(p => 
+      p.username.toLowerCase().includes(mentionQuery.toLowerCase())
+    ).slice(0, 5)
+  );
+
   // Slider Drag-to-close handlers
   let commentListElement = $state<HTMLElement | null>(null);
   let touchStartY = 0;
@@ -176,6 +188,7 @@
     commentImagePreview = null;
     currentDragY = 0;
     isDraggingSheet = false;
+    showMentionList = false;
 
     const { data, error } = await supabase
       .from('request_comments')
@@ -204,6 +217,7 @@
     commentImagePreview = null;
     currentDragY = 0;
     isDraggingSheet = false;
+    showMentionList = false;
   }
 
   function handleSliderTouchStart(e: TouchEvent) {
@@ -234,6 +248,49 @@
     }
     touchStartY = 0;
     isDraggingSheet = false;
+  }
+
+  // --- Détection et insertion des Mentions ---
+  function handleCommentInput(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const cursorPos = input.selectionStart || 0;
+    const textBeforeCursor = newCommentText.slice(0, cursorPos);
+    const lastAtPos = textBeforeCursor.lastIndexOf('@');
+
+    if (lastAtPos !== -1) {
+      const charBeforeAt = lastAtPos > 0 ? textBeforeCursor[lastAtPos - 1] : ' ';
+      const textAfterAt = textBeforeCursor.slice(lastAtPos + 1);
+
+      // Le @ doit être au début ou précédé d'un espace, sans espaces après
+      if ((charBeforeAt === ' ' || charBeforeAt === '\n') && !textAfterAt.includes(' ')) {
+        mentionStartIndex = lastAtPos;
+        mentionQuery = textAfterAt;
+        showMentionList = true;
+        return;
+      }
+    }
+
+    showMentionList = false;
+  }
+
+  function selectMention(username: string) {
+    if (mentionStartIndex === -1) return;
+
+    const cursorPos = commentInputRef?.selectionStart || newCommentText.length;
+    const beforeMention = newCommentText.slice(0, mentionStartIndex);
+    const afterMention = newCommentText.slice(cursorPos);
+
+    newCommentText = `${beforeMention}@${username} ${afterMention}`;
+    showMentionList = false;
+
+    // Repositionner le curseur juste après la mention insérée
+    setTimeout(() => {
+      if (commentInputRef) {
+        commentInputRef.focus();
+        const newCursorPos = beforeMention.length + username.length + 2;
+        commentInputRef.setSelectionRange(newCursorPos, newCursorPos);
+      }
+    }, 10);
   }
 
   async function compressImageClient(file: File): Promise<File> {
@@ -345,6 +402,7 @@
     if ((!newCommentText.trim() && !commentImageFile) || !activeCommentRequestId || !currentUserId || isSendingComment) return;
 
     isSendingComment = true;
+    showMentionList = false;
     let imageUrl: string | null = null;
 
     try {
@@ -395,11 +453,10 @@
         if (req) {
           req.comments_count = (req.comments_count || 0) + 1;
 
-          // --- Notifications ciblées & Mentions @pseudo ---
+          // Notifications ciblées & Mentions @pseudo
           const commenterName = myProfile?.username || 'Un membre';
           const targetUserIds = new Set<string>();
 
-          // Notifier le créateur du vote et la cible
           if (req.creator_id && req.creator_id !== currentUserId) {
             targetUserIds.add(req.creator_id);
           }
@@ -407,7 +464,6 @@
             targetUserIds.add(req.target_id);
           }
 
-          // Détecter les mentions @pseudo
           const matches = content.match(/@([a-zA-Z0-9_-]+)/g);
           if (matches) {
             matches.forEach((tag) => {
@@ -1393,7 +1449,7 @@
   </nav>
 </div>
 
-<!-- Modal Bottom-Sheet Commentaires avec Slider Drag Down -->
+<!-- Modal Bottom-Sheet Commentaires avec Slider Drag Down & Mentions -->
 {#if activeCommentRequestId}
   <div 
     class="comment-backdrop" 
@@ -1467,11 +1523,31 @@
         {/if}
       </div>
 
-      <!-- Prévisualisation Image sélectionnée -->
+      <!-- Aperçu Image sélectionnée -->
       {#if commentImagePreview}
         <div class="comment-img-preview-bar">
           <img src={commentImagePreview} alt="Aperçu commentaire" />
           <button type="button" class="remove-preview-btn" onclick={() => { commentImageFile = null; commentImagePreview = null; }}>✕</button>
+        </div>
+      {/if}
+
+      <!-- Menu déroulant Autocomplétion des Mentions -->
+      {#if showMentionList && filteredMentionProfiles.length > 0}
+        <div class="mention-dropdown">
+          {#each filteredMentionProfiles as profile}
+            <button 
+              type="button" 
+              class="mention-item" 
+              onclick={() => selectMention(profile.username)}
+            >
+              {#if profile.avatar_url}
+                <img src={profile.avatar_url} alt={profile.username} class="mention-avatar" />
+              {:else}
+                <div class="mention-avatar-placeholder">{profile.username.charAt(0).toUpperCase()}</div>
+              {/if}
+              <span class="mention-name">@{profile.username}</span>
+            </button>
+          {/each}
         </div>
       {/if}
 
@@ -1488,10 +1564,13 @@
         />
 
         <input 
+          bind:this={commentInputRef}
           type="text" 
-          placeholder="Écris ton commentaire... (@pseudo)" 
+          placeholder="Écris un commentaire (@pseudo)..." 
           bind:value={newCommentText} 
+          oninput={handleCommentInput}
           disabled={isSendingComment} 
+          autocomplete="off"
         />
         <button type="submit" disabled={(!newCommentText.trim() && !commentImageFile) || isSendingComment}>
           {isSendingComment ? '...' : 'Envoyer'}
@@ -1858,6 +1937,7 @@
     animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
     transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
     will-change: transform;
+    position: relative;
   }
   .comment-sheet.dragging {
     transition: none;
@@ -2020,6 +2100,65 @@
     height: 22px;
     font-size: 11px;
     cursor: pointer;
+  }
+
+  /* Dropdown Mentions */
+  .mention-dropdown {
+    position: absolute;
+    bottom: calc(62px + env(safe-area-inset-bottom));
+    left: 16px;
+    right: 16px;
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 12px;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.5);
+    z-index: 50;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .mention-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: none;
+    border: none;
+    padding: 8px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    color: #e4e4e7;
+    text-align: left;
+    width: 100%;
+    transition: background 0.15s ease;
+  }
+  .mention-item:active {
+    background: #27272a;
+  }
+  .mention-avatar {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    object-fit: cover;
+  }
+  .mention-avatar-placeholder {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: #27272a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    font-weight: bold;
+    color: #fff;
+  }
+  .mention-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: #c084fc;
   }
 
   .comment-input-bar {
