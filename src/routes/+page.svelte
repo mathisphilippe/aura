@@ -60,7 +60,7 @@
   let lastSeason = $state<SeasonArchive | null>(null);
   let loading = $state(true);
 
-  // Commentaires
+  // Commentaires & Bottom Sheet Slider
   let activeCommentRequestId = $state<string | null>(null);
   let activeComments = $state<Comment[]>([]);
   let newCommentText = $state('');
@@ -69,11 +69,13 @@
   let isSendingComment = $state(false);
   let loadingComments = $state(false);
 
-  // Geste de fermeture du tiroir commentaires
-  let sheetStartY = 0;
-  let sheetCurrentY = $state(0);
+  // Slider Drag-to-close handlers
+  let commentListElement = $state<HTMLElement | null>(null);
+  let touchStartY = 0;
+  let currentDragY = $state(0);
+  let isDraggingSheet = $state(false);
 
-  // Pull-to-refresh
+  // Pull-to-refresh Feed
   let mainContainer = $state<HTMLElement | null>(null);
   let pullStartY = 0;
   let pullDistance = $state(0);
@@ -94,15 +96,13 @@
   let isUpdatingProfile = $state(false);
   let profileMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  // Notifications push state
+  // Push Notifications state
   let isPushSubscribed = $state(false);
   let pushLoading = $state(false);
 
-  // Lightbox & Téléchargement
+  // Lightbox & Médias
   let modalMediaUrl = $state<string | null>(null);
   let isDownloading = $state(false);
-
-  // Gestion du son vidéo
   let unmutedVideoId = $state<string | null>(null);
 
   // Profils filtrés et ordonnés
@@ -141,7 +141,7 @@
     return url.match(/\.(mp4|webm|ogg|mov)$/i) !== null;
   }
 
-  // Pull-to-refresh handlers
+  // Pull-to-refresh
   function handleTouchStart(e: TouchEvent) {
     if (activeCommentRequestId || !mainContainer || mainContainer.scrollTop > 0 || isRefreshing) return;
     pullStartY = e.touches[0].clientY;
@@ -151,7 +151,6 @@
     if (activeCommentRequestId || !mainContainer || mainContainer.scrollTop > 0 || isRefreshing || pullStartY === 0) return;
     const currentY = e.touches[0].clientY;
     const diff = currentY - pullStartY;
-
     if (diff > 0) {
       pullDistance = Math.min(diff * 0.45, 80);
     }
@@ -168,7 +167,75 @@
     pullDistance = 0;
   }
 
-  // Compression automatique des photos
+  // --- Gestion du Bottom Sheet Commentaires ---
+  async function openComments(requestId: string) {
+    activeCommentRequestId = requestId;
+    loadingComments = true;
+    newCommentText = '';
+    commentImageFile = null;
+    commentImagePreview = null;
+    currentDragY = 0;
+    isDraggingSheet = false;
+
+    const { data, error } = await supabase
+      .from('request_comments')
+      .select(`
+        id,
+        request_id,
+        user_id,
+        content,
+        image_url,
+        created_at,
+        user:profiles!request_comments_user_id_fkey(username, avatar_url)
+      `)
+      .eq('request_id', requestId)
+      .order('created_at', { ascending: true });
+
+    if (!error && data) {
+      activeComments = data as unknown as Comment[];
+    }
+    loadingComments = false;
+  }
+
+  function closeComments() {
+    activeCommentRequestId = null;
+    activeComments = [];
+    commentImageFile = null;
+    commentImagePreview = null;
+    currentDragY = 0;
+    isDraggingSheet = false;
+  }
+
+  function handleSliderTouchStart(e: TouchEvent) {
+    touchStartY = e.touches[0].clientY;
+    isDraggingSheet = false;
+  }
+
+  function handleSliderTouchMove(e: TouchEvent) {
+    const currentY = e.touches[0].clientY;
+    const diff = currentY - touchStartY;
+    const isAtTop = !commentListElement || commentListElement.scrollTop <= 0;
+
+    if (diff > 0 && isAtTop) {
+      isDraggingSheet = true;
+      currentDragY = diff;
+      if (e.cancelable) e.preventDefault();
+    } else {
+      currentDragY = 0;
+      isDraggingSheet = false;
+    }
+  }
+
+  function handleSliderTouchEnd() {
+    if (currentDragY > 120) {
+      closeComments();
+    } else {
+      currentDragY = 0;
+    }
+    touchStartY = 0;
+    isDraggingSheet = false;
+  }
+
   async function compressImageClient(file: File): Promise<File> {
     if (!file.type.startsWith('image/')) return file;
     return new Promise((resolve) => {
@@ -256,63 +323,6 @@
       unmutedVideoId = null;
     } else {
       unmutedVideoId = reqId;
-    }
-  }
-
-  // --- Gestion des Commentaires ---
-  async function openComments(requestId: string) {
-    activeCommentRequestId = requestId;
-    loadingComments = true;
-    newCommentText = '';
-    commentImageFile = null;
-    commentImagePreview = null;
-    sheetCurrentY = 0;
-
-    const { data, error } = await supabase
-      .from('request_comments')
-      .select(`
-        id,
-        request_id,
-        user_id,
-        content,
-        image_url,
-        created_at,
-        user:profiles!request_comments_user_id_fkey(username, avatar_url)
-      `)
-      .eq('request_id', requestId)
-      .order('created_at', { ascending: true });
-
-    if (!error && data) {
-      activeComments = data as unknown as Comment[];
-    }
-    loadingComments = false;
-  }
-
-  function closeComments() {
-    activeCommentRequestId = null;
-    activeComments = [];
-    commentImageFile = null;
-    commentImagePreview = null;
-    sheetCurrentY = 0;
-  }
-
-  function handleSheetTouchStart(e: TouchEvent) {
-    sheetStartY = e.touches[0].clientY;
-  }
-
-  function handleSheetTouchMove(e: TouchEvent) {
-    const currentY = e.touches[0].clientY;
-    const diff = currentY - sheetStartY;
-    if (diff > 0) {
-      sheetCurrentY = diff;
-    }
-  }
-
-  function handleSheetTouchEnd() {
-    if (sheetCurrentY > 120) {
-      closeComments();
-    } else {
-      sheetCurrentY = 0;
     }
   }
 
@@ -412,7 +422,6 @@
     }
   }
 
-  // --- Suppression d'un vote ---
   async function handleDeleteRequest(requestId: string) {
     if (!confirm("Voulez-vous vraiment annuler et supprimer ce vote ?")) return;
 
@@ -431,7 +440,6 @@
     }
   }
 
-  // --- Push Notifications ---
   async function checkPushSubscription() {
     if ('serviceWorker' in navigator && 'PushManager' in window) {
       const reg = await navigator.serviceWorker.getRegistration('/sw.js');
@@ -517,7 +525,6 @@
     await supabase.rpc('resolve_expired_aura_requests');
     await supabase.rpc('check_and_reset_monthly_aura');
 
-    // 1. Profils
     const { data: profilesData } = await supabase
       .from('profiles')
       .select('*')
@@ -533,7 +540,6 @@
       }
     }
 
-    // 2. Demandes actives avec commentaires
     const { data: requestsData } = await supabase
       .from('aura_requests')
       .select(`
@@ -561,7 +567,6 @@
       })) as AuraRequest[];
     }
 
-    // 3. Demandes résolues (1er du mois en cours)
     const now = new Date();
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
 
@@ -594,7 +599,6 @@
       });
     }
 
-    // 4. Archive du mois précédent
     const { data: seasonData } = await supabase
       .from('monthly_seasons')
       .select(`
@@ -1190,7 +1194,6 @@
             </section>
           </div>
         {:else}
-          <!-- Vue Liste Classement avec égalités au sommet -->
           {@const maxScore = displayedProfiles.length > 0 
             ? (subLeaderboardTime === 'alltime' ? (displayedProfiles[0].all_time_aura ?? displayedProfiles[0].aura_score ?? 100) : displayedProfiles[0].aura_score)
             : 0}
@@ -1345,7 +1348,7 @@
   </nav>
 </div>
 
-<!-- Modal Bottom-Sheet Commentaires -->
+<!-- Modal Bottom-Sheet Commentaires avec Slider Drag Down -->
 {#if activeCommentRequestId}
   <div 
     class="comment-backdrop" 
@@ -1356,17 +1359,15 @@
   >
     <div 
       class="comment-sheet" 
-      style="transform: translateY({sheetCurrentY}px);"
+      class:dragging={isDraggingSheet}
+      style="transform: translateY({currentDragY}px);"
       onclick={(e) => e.stopPropagation()} 
       role="presentation"
+      ontouchstart={handleSliderTouchStart}
+      ontouchmove={handleSliderTouchMove}
+      ontouchend={handleSliderTouchEnd}
     >
-      <!-- Zone tactile de drag down pour fermer le tiroir -->
-      <div 
-        class="sheet-header"
-        ontouchstart={handleSheetTouchStart}
-        ontouchmove={handleSheetTouchMove}
-        ontouchend={handleSheetTouchEnd}
-      >
+      <div class="sheet-header">
         <div class="sheet-handle"></div>
         <div class="sheet-title-row">
           <h3>Commentaires</h3>
@@ -1374,7 +1375,7 @@
         </div>
       </div>
 
-      <div class="comment-list">
+      <div class="comment-list" bind:this={commentListElement}>
         {#if loadingComments}
           <div class="comment-loading"><div class="spinner"></div></div>
         {:else if activeComments.length === 0}
@@ -1421,7 +1422,7 @@
         {/if}
       </div>
 
-      <!-- Prévisualisation de l'image sélectionnée pour le commentaire -->
+      <!-- Prévisualisation Image sélectionnée -->
       {#if commentImagePreview}
         <div class="comment-img-preview-bar">
           <img src={commentImagePreview} alt="Aperçu commentaire" />
@@ -1430,7 +1431,6 @@
       {/if}
 
       <form onsubmit={handleAddComment} class="comment-input-bar">
-        <!-- Bouton Upload Image Commentaire -->
         <label for="comment-img-input" class="comment-upload-btn" title="Ajouter une image">
           📷
         </label>
@@ -1789,7 +1789,7 @@
     color: #fff;
   }
 
-  /* Modal Bottom Sheet Commentaires */
+  /* Bottom Sheet Commentaires */
   .comment-backdrop {
     position: fixed;
     inset: 0;
@@ -1811,7 +1811,11 @@
     display: flex;
     flex-direction: column;
     animation: slideUp 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-    transition: transform 0.1s ease-out;
+    transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: transform;
+  }
+  .comment-sheet.dragging {
+    transition: none;
   }
   @keyframes slideUp {
     from { transform: translateY(100%); }
@@ -1823,11 +1827,12 @@
     display: flex;
     flex-direction: column;
     align-items: center;
-    touch-action: pan-y;
+    touch-action: none;
+    cursor: grab;
   }
   .sheet-handle {
-    width: 36px;
-    height: 4px;
+    width: 38px;
+    height: 5px;
     background: #3f3f46;
     border-radius: 10px;
     margin-bottom: 8px;
